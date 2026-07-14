@@ -1,0 +1,22 @@
+# ROS2 colcon build artifacts (regenerable via colcon build)
+build/
+install/
+log/
+*/build/
+*/install/
+*/log/
+
+# rosbag recordings (large binary data)
+white_ws/ros2bag/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 대용량 백업 압축본 (GitHub 100MB 파일 제한 초과, src는 이미 폴더로 추적됨)
+white_ws0709b.zip
+
+# OS
+.DS_Store
+Thumbs.db
