@@ -30,10 +30,13 @@ from scipy.spatial import KDTree
 
 
 # ══════════════════════════════════════════════════════
-#  기본 경로
+#  기본 경로 (스크립트 위치 기준 자동 산출 → 사용자명/워크스페이스 이동 무관)
+#    예전엔 /home/dohyeon/white_ws0709b/... 로 박혀 있어 다른 장비에선 무조건
+#    실패했다. map_check_fusion.py 와 동일한 방식으로 통일한다.
 # ══════════════════════════════════════════════════════
-DEFAULT_ROUTE_DIR = Path("/home/dohyeon/white_ws/gps_data")
-DEFAULT_BAG_DIR   = Path("/home/dohyeon/white_ws/ros2bag")
+BASE_DIR          = Path(__file__).resolve().parent.parent
+DEFAULT_ROUTE_DIR = BASE_DIR / "gps_data"
+DEFAULT_BAG_DIR   = BASE_DIR / "ros2bag"
 
 W = 60  # 터미널 박스 너비
 

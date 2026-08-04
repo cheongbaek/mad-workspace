@@ -80,6 +80,20 @@ class MotorNode(Node):
 
         # ─── 퍼블리셔 ───
         self.pub_encoder = self.create_publisher(Int32, '/encoder', 10)
+        # [속도 상한 검증] 아두이노 속도PID 의 실제 PWM 출력. 'P,pwm' 프레임으로 수신.
+        #   목적: "속도가 안 나는 게 PWM 포화 때문인가"를 로스백으로 직접 확인한다.
+        #   (E 프레임은 건드리지 않음 — 기존 파싱/dt 진단 규약 그대로 유지)
+        self.pub_pwm = self.create_publisher(Int32, '/motor_pwm', 10)
+        # [FIX-5, 2026-07-30] A15 포텐셔미터 실측 조향각. 'A,angle' 프레임으로 수신.
+        #   목적: driving.py 의 clamped_steer(명령, 같은 deg 단위)와 직접 대조해
+        #   명령→실현 지연·비율을 추정이 아니라 측정으로 구한다(LFD 상향 재시도 때
+        #   지연 추정이 로스백마다 0.70~1.25s로 갈려 설계가 실측과 안 맞았던 문제).
+        self.pub_steer_angle = self.create_publisher(Int32, '/steer_angle_measured', 10)
+        # [FIX-6, 2026-07-30] 조향 PID 의 실제 PWM 출력. 'D,pwm' 프레임으로 수신.
+        #   목적: /steer_angle_measured 가 정상속도 주행 중에도 몇 초씩 안 움직이는
+        #   구간을 발견했는데(로스백 18_36_42, 82%), 이게 PID 가 PWM 을 안 내는 건지
+        #   PWM 은 나가는데 기구적으로 안 움직이는 건지 이걸로 구분한다.
+        self.pub_steer_pwm = self.create_publisher(Int32, '/steer_pwm', 10)
 
         # ─── 서브스크라이버 ───
         self.create_subscription(Twist, '/cmd_vel_raw',
@@ -135,6 +149,16 @@ class MotorNode(Node):
             ser.port     = port
             ser.baudrate = self.serial_baud
             ser.timeout  = SERIAL_TIMEOUT
+            # [2026-07-30] 이전 launch 가 완전히 안 죽고 남아 있으면(background 스레드가
+            #   blocking read 중이면 SIGINT 만으로는 안 죽는다) pyserial 은 기본적으로
+            #   같은 포트를 여러 프로세스가 동시에 여는 것을 막지 않는다. 그 상태로 두면
+            #   두 프로세스가 같은 UART 바이트를 나눠 받아 서로 다른 값을 파싱하고,
+            #   TX 도 두 프로세스가 동시에 쓸 수 있어 아두이노 쪽 명령 프레임이 깨질 수 있다.
+            #   (오늘 로스백에서 /motor_pwm 이 /encoder 의 2.83배로 찍힌 원인 — 아두이노
+            #   코드는 E/P 를 항상 1:1로 보내므로 수신측 중복이 확실했다.)
+            #   exclusive=True 로 열면 이미 열려 있는 포트는 open() 이 SerialException 을
+            #   던져 아래 except 절에서 바로 로그로 드러난다(조용히 중복되는 대신 실패).
+            ser.exclusive = True
 
             if reset_board:
                 # 최초 실행 때만 IDE 시리얼 모니터 방식 리셋을 수행한다.
@@ -229,6 +253,42 @@ class MotorNode(Node):
                     parts = line.split(',')
                     if len(parts) < 2:
                         continue
+
+                    # [속도 상한 검증] 'P,pwm' — 아두이노 속도PID 의 실제 PWM 출력.
+                    #   E 프레임과 독립된 별도 프레임이라 기존 규약에 영향 없다.
+                    #   펌웨어가 아직 P 를 안 보내면 이 분기는 그냥 안 타므로 하위호환.
+                    if parts[0] == 'P':
+                        try:
+                            pwm_msg = Int32()
+                            pwm_msg.data = int(float(parts[1]))
+                            self.pub_pwm.publish(pwm_msg)
+                        except ValueError:
+                            pass
+                        continue
+
+                    # [FIX-5] 'A,angle' — A15 포텐셔미터 실측 조향각(deg).
+                    #   P 와 같은 독립 프레임 방식. 펌웨어가 아직 A 를 안 보내면
+                    #   이 분기는 안 타므로 하위호환.
+                    if parts[0] == 'A':
+                        try:
+                            angle_msg = Int32()
+                            angle_msg.data = int(float(parts[1]))
+                            self.pub_steer_angle.publish(angle_msg)
+                        except ValueError:
+                            pass
+                        continue
+
+                    # [FIX-6] 'D,pwm' — 조향PID 의 실제 PWM 출력. A 와 짝지어 보면
+                    #   기구 고착(D 큼·각도 안 변함) vs 전원/PID 미출력(D≈0) 을 가른다.
+                    if parts[0] == 'D':
+                        try:
+                            spwm_msg = Int32()
+                            spwm_msg.data = int(float(parts[1]))
+                            self.pub_steer_pwm.publish(spwm_msg)
+                        except ValueError:
+                            pass
+                        continue
+
                     if parts[0] != 'E':
                         continue
 
@@ -260,7 +320,12 @@ class MotorNode(Node):
                 self.ser = None
                 break
             except Exception as e:
-                self.get_logger().warn(f'RX 처리 예외: {e}')
+                # 종료 경합(rx_thread 가 join 타임아웃 중 blocking read 에서 막 깨어나
+                # publish 하는 순간 메인스레드가 이미 rclpy.shutdown() 한 경우) 시엔
+                # get_logger().warn() 도 rosout publish 라 똑같이 실패해 줄이 배로
+                # 찍힌다. context 가 이미 죽었으면 로깅도 생략한다.
+                if rclpy.ok():
+                    self.get_logger().warn(f'RX 처리 예외: {e}')
                 continue
 
     def _check_arduino_dt(self, dt_us):
@@ -427,7 +492,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

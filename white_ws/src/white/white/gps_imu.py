@@ -1,6 +1,32 @@
 #!/usr/bin/env python3
 """
-gps_imu.py  ― GPS-IMU 융합 노드  [v5.8 - 융합비 튜닝 파라미터(비교분석용)]
+gps_imu.py  ― GPS-IMU 융합 노드  [v5.8.1 - 초기 헤딩 lock IMU 게이트 + gps_course_only]
+
+────────────────────────────────────────────────
+v5.8 → v5.8.1 변경 (① 초기 헤딩 lock IMU 게이트  ② 비교실험 인프라)
+────────────────────────────────────────────────
+· fusion_mode를 ROS2 파라미터로 전환(declare_parameter, 런타임 set_parameters 가능).
+  prompt.py의 "GPS 단독"/"IMU 단독" 비교주행 메뉴가 이 파라미터를 바꿔 호출한다.
+  전환 시 is_heading_locked/yaw_offset/위치는 초기화하지 않음(연속성 유지;
+  운영은 정지 상태에서 전환 권장).
+· "gps_course_only" 모드 신설 — 위치뿐 아니라 헤딩도 연속 GPS 코스(atan2(Δy,Δx),
+  LPF α=0.35)로 산출. 기존 "gps_raw"는 헤딩이 사실상 IMU(offset 고정)라 진짜
+  'GPS 단독 헤딩'이 아니었던 문제를 해결 — GPS만/IMU만 비교주행의 GPS쪽은 이 모드 사용.
+· fused/gps_raw/dr_only/gps_course_only 네 모드 전부 뒷차축 투영 통일
+  (기존 gps_raw만 안테나 원시좌표 발행 → 기준점이 달라 비교지표 왜곡 가능했음).
+· /fusion_config 토픽 신설 — 시작 시 1회 + 모드 전환 시마다 현재 설정 발행(rosbag 자동기록).
+
+────────────────────────────────────────────────
+v5.8.0.1 변경 (초기 헤딩 lock 직진 판정에 IMU 추가)
+────────────────────────────────────────────────
+· 기존: lock 직진 판정 = GPS 변위방향 spread 단독 → 저속 GPS 노이즈에 취약하고,
+  완만한 선회는 코드(chord)방향이 천천히 변해 spread 한도 안에서 오록(誤lock) 가능.
+· 추가(AND 게이트 — 헤딩 '값'은 여전히 GPS 변위방향이 결정, IMU는 거부권만):
+  ① gyro_z_abs_lpf < HEADING_LOCK_GYRO_MAX_DPS(4°/s) — 순간 회전 게이트.
+     주행 중 drift 보정·연속미세보정의 gyro 게이트와 동일 패턴.
+  ② lock 창 IMU unwrap 헤딩 총변화 ≤ HEADING_LOCK_IMU_SPAN_DEG(6°)
+     — 샘플 축적 구간 '전체'가 직진이었음을 보장(①이 못 잡는 완만 선회 차단).
+· IMU 미수신 시엔 두 값 모두 0으로 남아 기존(GPS 단독)과 동일하게 동작(폴백 유지).
 
 ────────────────────────────────────────────────
 v5.7.1 → v5.8 변경 (GPS:IMU 융합 비율 비교분석)
@@ -76,9 +102,13 @@ v4.9 → v5.0 변경 (로스백 분석 결과 반영)
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float64MultiArray, Int32, String
+from rcl_interfaces.msg import SetParametersResult
+from std_msgs.msg import Float64MultiArray, Float32MultiArray, Int32, String
 from sensor_msgs.msg import NavSatFix, Imu
 import math, time, threading
+
+# [kasa 이식] 엔코더 환산 상수의 단일 소유자
+from white import kasa_units as ku
 from collections import deque   # [v5.7.1] 자세 이력(시간정렬용)
 
 
@@ -131,30 +161,107 @@ class GpsImuNode(Node):
     POS_GPS_ALPHA = 1.0
 
     # HEADING_GPS_TRUST : 헤딩 보정(GPS→IMU offset) 강도 스케일 (0.0 ~ 2.0 권장)
-    #   1.0 = 현행 (drift 보정 gain 0.04~0.10 + 연속미세보정 gain 0.04)
+    #   1.0 = 기존 (drift 보정 gain 0.04~0.10 + 연속미세보정 gain 0.04)
     #   0.0 = 헤딩에 GPS 불개입 (고정 순간의 yaw_offset 동결 → 순수 IMU 헤딩)
-    #   실효 시정수 ≈ INTERVAL/(gain·trust) : trust=1→약 10~25s, trust=2→5~12s
+    #   [카메라 융합] 카메라 미사용/두절 시엔 이 값(1.0) 그대로 = GPS 단독 성능 무손상.
+    #   카메라가 신선할 때만 아래 CAM_GPS_TRUST_SCALE 로 낮춰 9:0.5:0.5 를 만든다.
     HEADING_GPS_TRUST = 1.0
-
-    # PROJECT_TO_REAR_AXLE : 안테나→뒷차축 투영(d=0.865m) 사용 여부
-    #   False = 안테나 원시좌표 그대로 발행 (v5.7 이전 동작 재현 실험용)
-    #   ※ gps_raw 프리셋은 강제 False
-    PROJECT_TO_REAR_AXLE = True
-
-    # DR_FALLBACK_ENABLED : α=1.0(레거시)일 때 GPS 단절 → DR 전환 + 복구 3초 블렌딩
-    #   False = 단절 시 위치 갱신 정지 (α<1 연속 상보필터에선 어차피 미사용)
-    #   ※ gps_raw 프리셋은 강제 False
-    DR_FALLBACK_ENABLED = True
-
-    # GPS_SOLUTION_LATENCY_S : GPS 코스 시간정렬 지연 [s] (drift 측정 품질)
-    #   실측 0.13 (v5.7.1: 변위 시간중심 0.1s와 합쳐 총 0.23s 위상 보정).
-    #   0.0 = 시간정렬 해제 (정렬 전(v5.7) 동작 재현 실험용)
-    GPS_SOLUTION_LATENCY_S = 0.13
     # ══════════════════════════════════════════════════════════════════
 
-    WHEEL_CIRCUMFERENCE = 0.27 * math.pi
-    TICKS_PER_REV       = 300.0
-    ENC_DT              = 0.01
+    # ══════════════════════════════════════════════════════════════════
+    # [카메라 융합 v1] 차선 기반 헤딩 보정
+    #   현재 실효 비율 : IMU : GPS : Cam = 9 : 0.5 : ★0.2★
+    #     · GPS  = HEADING_GPS_TRUST(1.0) × CAM_GPS_TRUST_SCALE(0.5) = 0.5
+    #     · Cam  = CAM_HEADING_TRUST     = 0.2   (2026-07-29 에 0.5 → 0.2 하향, 아래 근거)
+    #   카메라 두절 시 : 9 : 1.0 : 0     (GPS 가 몫을 회수 — 대칭 degrade)
+    #   GPS  단절 시(DR) : 9 : 0 : 1.0   (CAM_HEADING_TRUST_DR — 카메라가 GPS 몫 흡수)
+    #   ※ 이 줄은 예전에 "9:0.5:0.5" 로 남아 있어 실제 상수(0.2)와 어긋났다. 런타임 로그
+    #     (아래 get_logger 의 'IMU:GPS:Cam≈...')는 상수를 그대로 찍으므로 항상 로그가 옳다.
+    # ══════════════════════════════════════════════════════════════════
+    # 원리: /lane_metrics 의 theta_lane_deg(차선 대비 헤딩오차, CCW+)를 직진 구간에서
+    #   0 으로 당겨 IMU 헤딩 drift 를 억제. GPS 연속미세보정과 같은 철학(직선에서만),
+    #   지도 없이 동작(theta 자체가 상대 오차). map 접선이 필요없어 gps_imu 안에서 자족적.
+    # 정상주행: trust=CAM_HEADING_TRUST. GPS 단절(DR): GPS 보정이 자동으로 0 →
+    #   카메라가 그 몫 흡수(trust=CAM_HEADING_TRUST_DR).
+    #
+    # ── [2026-07-29] CAM_HEADING_TRUST 0.5 → 0.2 하향 ────────────────────────
+    # 근거(rosbag 19_02_10, max_speed 1.5, 직진 순항 1.24m/s):
+    #   · 직진에서 조향이 0 주위로 std 2.87° 진동(주기 8~10.5s). PP 기하항이 지배
+    #     (std 2.57)하고 PID 항은 미미(std 0.37) → 경로추종이 아니라 제어 진동.
+    #   · theta_lane_deg 와 cam_head_applied 의 주피크가 0.119Hz(8.4s) 로 **조향 진동과
+    #     정확히 동일**. 반면 yaw_offset 은 0.020Hz 느린 드리프트만.
+    #   · 반주기(4.2s) 누적 카메라 보정이 평균 0.62° / 최대 2.52°.
+    #     PP 감도(2·L·α/LFD, L=0.73 LFD=2.44)로 환산하면 조향 0.37°/1.51° →
+    #     실측 조향진동(std 2.87°)의 **최대 52% 를 카메라가 만들고 있다**.
+    # 왜 가진(加振)이 되나:
+    #   theta_lane 은 순시 오차가 아니라 차량 앞 ~1.5m 의 **preview** 다
+    #   (1.24m/s 에서 기하 선행 1.21s, 실측 요레이트 대비 선행 1.95s).
+    #   위상이 앞선 신호를 '0 으로 당기면' 진동 주파수에서 감쇠가 아니라 가진으로 작동한다.
+    # 정황: tool/trust_sweep.py 로 3개 로스백 검증 시 트러스트를 올릴수록 DR drift 가
+    #   단조 증가했다(창 5~12s 전부) — 방향이 일치.
+    # ⚠️ GPS 쪽(CAM_GPS_TRUST_SCALE)은 일부러 안 건드렸다. 한 번에 두 변수를 바꾸면
+    #   A/B 판정이 불가능해진다. 총 외부보정 권한은 그만큼 줄지만, IMU 는 단기(20s)에
+    #   헤딩을 0.1° 로 재현하므로 1분 내외 주행에서는 문제되지 않는다.
+    # 되돌리려면 cam_heading_trust 를 0.5 로.
+    CAM_HEAD_ENABLE       = True
+    CAM_HEADING_TRUST     = 0.2                    # 정상주행 카메라 헤딩 보정 권한(구 0.5)
+    CAM_HEADING_TRUST_DR  = 1.0                    # GPS 단절 시(카메라가 GPS 몫 흡수)
+    # 카메라가 신선할 때 GPS 헤딩보정에 곱하는 스케일. 카메라 두절 시 1.0 회수(대칭 degrade).
+    #   신선: GPS 0.5 + Cam 0.5 (= 9:0.5:0.5).  두절: GPS 1.0 + Cam 0 (GPS 단독 무손상).
+    CAM_GPS_TRUST_SCALE   = 0.5
+    CAM_HEAD_GAIN         = 0.04                   # 감지 오차의 4%씩(GPS drift 와 동급)
+    CAM_HEAD_MIN_DEG      = 0.5                    # 이보다 작으면 노이즈로 무시
+    CAM_HEAD_MAX_DEG      = 15.0                   # 이보다 크면 오검출 의심 → 무시
+    CAM_HEAD_MAX_STEP_DEG = 0.5                    # 1회 보정 최대 [deg] (급변 방지)
+    CAM_HEAD_INTERVAL     = 0.20                   # [s] 보정 최소 간격
+    CAM_HEAD_MAX_AGE      = 0.40                   # [s] /lane_metrics 신선도
+    CAM_HEAD_CONF_MIN     = 0.35                   # 유효 conf 하한
+    CAM_HEAD_MAX_GYRO     = math.radians(10.0)     # 직진 중에만(연속보정과 동일)
+    # ★[2026-07-15 실측 버그수정] 정지 중 보정 폭주 차단.
+    #   이 보정의 되먹임은 '차량의 물리적 움직임'을 통해 닫힌다 — 헤딩추정이 틀리면 조향이
+    #   틀어지고 → 차가 차선에서 비뚤어지고 → 카메라가 theta≠0 을 보고 → yaw_offset 이
+    #   고쳐지고 → 차가 다시 정렬된다. 그런데 정지 중엔 차가 못 돌아 theta 가 상수로 남고,
+    #   루프가 열린 채 보정만 무한 적분된다.
+    #   실측(rosbag2_2026_07_15-22_24_21): 완전정지 13초 동안 theta 가 -12° 로 고정된 채
+    #     보정 50회(전체 76회의 66%)가 계속 걸려 heading 이 -18.85°, yaw_offset 이 -19.80°
+    #     회전했다. 차는 1cm 도 안 움직였다. 로스백이 끝나 안 보일 뿐 멈출 기미가 없었다.
+    #   자이로 게이트(CAM_HEAD_MAX_GYRO)는 '정지'와 '직진'을 구분하지 못한다(둘 다 ω≈0)
+    #     → 속도 게이트가 반드시 따로 필요하다.
+    CAM_HEAD_MIN_SPEED    = 0.3                    # [m/s] 이보다 느리면 보정 금지
+    # 부호규약: theta_lane(CCW+)=지도접선−헤딩 → 정렬하려면 yaw_offset += gain·theta.
+    #   BEV/카메라 장착에 따라 반대일 수 있어 노브로 노출.
+    #   [2026-07-15 1차 실측] 위 폭주버그로 heading 이 오염돼 확정 실패. 참고치로는
+    #     주행구간에서 theta vs heading_err 상관이 모든 lag 에서 음수(최대 lag0.80s r=-0.790).
+    #   [2026-07-16 실측확정] map_check_fusion [CAM_HEAD_SIGN 실측],
+    #     rosbag2_2026_07_15-22_24_21, 속도(≥0.3m/s)·자이로(≤10°/s)·conf(≥0.5) 게이트:
+    #     n=90 피크 lag=0.70s slope=-0.45 R²=0.68 → slope<0 → 규약 성립 → +1.0 확정.
+    #     (정지 폭주 표본은 속도게이트로 배제된 판정. 깨끗한 재주행 시 재확인 권장.)
+    #   [2026-07-16 재확인 완료] 속도게이트 반영 빌드로 재주행(rosbag2_2026_07_16-21_33_05).
+    #     헤딩 수렴 확인(주행 중 hdg_err mean=-1.38°) 상태에서 n=319 slope=-0.76 R²=0.93
+    #     → +1.0 최종 확정. (1차의 slope 크기 미달(-0.45)은 폭주로 오염된 헤딩 때문이었음)
+    CAM_HEAD_SIGN         = +1.0
+    # ══════════════════════════════════════════════════════════════════
+
+    # ── 엔코더 환산 상수 ──────────────────────────────────────────────────
+    # ★ [kasa 이식] 값은 white/kasa_units.py 가 소유한다 ★ driving.py / sensor_monitor.py
+    #   와 반드시 같은 값이어야 한다(예전엔 세 곳이 각자 리터럴을 갖고 있었다).
+    #     이전(white) : 0.8482 m / 300틱 / 10ms → 1틱   = 0.283 m/s
+    #     현재(kasa)  : 1.6971 m / 192카운트 / 20ms → 1카운트 = 0.442 m/s
+    #   192 = 홀 96(=3상 XOR 6엣지 × 16극쌍) × 2 — /encoder 가 ★좌+우 합★이기 때문이다.
+    WHEEL_CIRCUMFERENCE = ku.WHEEL_CIRCUMFERENCE_M
+    TICKS_PER_REV       = float(ku.ENCODER_COUNTS_PER_REV)
+    ENC_DT              = ku.PULSE_WINDOW_S
+
+    # ★ [kasa 이식] 엔코더 '활성' 판정 임계 (카운트 단위) ★
+    #   원래 cb_encoder 안에 리터럴 1.0 으로 두 번 박혀 있던 값이다. 물리적 의미가
+    #   단위 교체로 바뀌었으므로 이름을 붙여 근거를 남긴다:
+    #     white : 1틱   = 0.283 m/s 이상 움직이면 활성
+    #     kasa  : 1카운트 = 0.442 m/s 이상 움직이면 활성
+    #   ★ 이 값을 1.0 미만으로 낮춰도 효과가 없다 ★ /encoder 가 정수라서 0 다음 값이
+    #   1 이다. 즉 0.442 m/s 가 양자화가 정한 실질 하한이다.
+    #   그래서 driving.py 의 min_speed_ms(≈0.95 m/s)가 이 값보다 위여야 한다 —
+    #   아니면 자율주행을 시작해도 encoder_active 가 안 켜져 헤딩 고정이 영구히 안 된다.
+    ENCODER_ACTIVE_MIN_COUNT = 1.0
 
     # ─── [v5.4] IMU drift 보정 파라미터: 코너 오보정 방지 ───────────────
     # 로스백 분석: IMU vs GPS 실제 방향 오차 = 3~6° (핵심 CTE 원인)
@@ -197,9 +304,9 @@ class GpsImuNode(Node):
     # 그만큼 과거) → 코너에서 ±7~10° phantom drift가 회전방향 따라 번갈아 발동,
     # 헤딩을 좌우로 흔들었음(슬라럼 밀림 기여). 변위 구간의 '시간 중심'(0.5×fix간격)
     # + RTK 솔루션 지연을 합쳐 그 시점의 헤딩·자이로로 기대코스를 계산해 정렬.
-    # 실측 총지연 0.23s = 0.5×0.2s(5Hz) + 0.13s.
+    # 실측 총지연 0.23s = 0.5×0.2s(5Hz) + 0.13s → 아래 값.
     # 정렬 효과(실측): drift 측정 std 4.36°→2.26°, 오발동(>6°) 14%→2%.
-    # → [v5.8] 상수(GPS_SOLUTION_LATENCY_S)는 상단 융합 노브 블록으로 이동.
+    GPS_SOLUTION_LATENCY_S = 0.13
 
     HEADING_MAX_RATE_DPS = 200.0
 
@@ -219,6 +326,15 @@ class GpsImuNode(Node):
     HEADING_LOCK_SPREAD_DEG      = 15.0  # v5.5: 초기 헤딩을 너무 흔들린 GPS 1m 이동값으로 고정하지 않음
 
     HEADING_LOCK_BUF_SIZE = 7    # v5.5: 5→7, 1초 내외 방향 안정성 확인
+
+    # ── [v5.8.1] 초기 헤딩 lock IMU 직진 게이트 ─────────────────────────
+    # GPS spread는 '측정값 일관성'만 보고, 자이로는 '차체 회전 안정성'을 봄 → AND 병용.
+    HEADING_LOCK_GYRO_MAX_DPS = 4.0   # 순간 요레이트(LPF) 이 이상이면 회전 중 → lock 보류
+    HEADING_LOCK_IMU_SPAN_DEG = 6.0   # lock 창 동안 IMU 헤딩 총변화 허용폭(창 전체 직진 보장)
+    # [v5.8.1] 탈출구: 다른 조건(GPS이동/spread/엔코더)은 다 충족했는데 IMU 게이트만
+    # 이 시간 이상 계속 막고 있으면 우회(경고 로그 남기고 lock 허용). 진동이 심한 노면 등
+    # 실제로 gyro_ok_lock/span이 영영 안 풀리는 경우 차량이 영원히 대기하는 것 방지.
+    HEADING_LOCK_IMU_GATE_TIMEOUT_S = 8.0
 
     # ── [v5.3 강화] 연속 헤딩 미세 보정 ─────────────────────────────────
     CONT_CORRECT_ENABLED         = True
@@ -245,32 +361,38 @@ class GpsImuNode(Node):
     GPS_BLEND_DURATION  = 3.0
     PITCH_CALIB_SECS    = 2.0
 
+    # ── [v5.8.1] gps_course_only 모드용 연속 GPS 코스헤딩 ────────────────
+    # heading = atan2(Δy,Δx)(연속, LPF) — gps_raw와 달리 헤딩도 진짜 GPS 단독.
+    GPS_COURSE_LPF_ALPHA  = 0.35   # 시정수 ≈ fix간격/α (5Hz 기준 약 0.6s)
+    GPS_COURSE_MIN_DIST_M = 0.15   # 이 이상 이동했을 때만 코스방향 갱신(저속 GPS노이즈 방지)
+
     def __init__(self):
         super().__init__("gps_imu_node")
 
         self._lock = threading.Lock()
 
-        # ── [v5.8] 융합 노브 해석 (프리셋 → 실효 파라미터) ─────────────────
-        _mode = str(self.FUSION_MODE).lower()
-        if _mode == "gps_raw":
-            self._pos_gps_alpha     = 1.0
-            self._heading_gps_trust = 0.0
-            self._project_enabled   = False   # 안테나 원시좌표 그대로 발행
-        elif _mode == "dr_only":
-            self._pos_gps_alpha     = 0.0
-            self._heading_gps_trust = 0.0
-            self._project_enabled   = bool(self.PROJECT_TO_REAR_AXLE)  # (위치에 GPS 미반영이라 실질 무관)
-        else:
-            _mode = "fused"
-            self._pos_gps_alpha     = max(0.0, min(1.0, float(self.POS_GPS_ALPHA)))
-            self._heading_gps_trust = max(0.0, float(self.HEADING_GPS_TRUST))
-            self._project_enabled   = bool(self.PROJECT_TO_REAR_AXLE)
-        self._fusion_mode = _mode
-        # α<1 이면 연속 상보필터: cb_encoder가 DR 예측을 상시 적분, fix마다 α-당김.
-        # 이 모드에선 레거시 DR 전환/3초 블렌딩 머신을 쓰지 않는다(α-수렴이 대체).
-        self._pos_fusion_active   = self._pos_gps_alpha < 1.0
-        self._dr_fallback_enabled = ((not self._pos_fusion_active) and _mode != "gps_raw"
-                                     and bool(self.DR_FALLBACK_ENABLED))
+        # ── [v5.8.1] 융합 노브: ROS2 파라미터화(런타임 전환 가능) ───────────
+        # fusion_mode 파라미터로 실행 중 전환 가능(prompt.py의 GPS단독/IMU단독
+        # 비교주행 노브가 /gps_imu_node/set_parameters로 이 값을 바꿈).
+        # 최초값은 기존 클래스 상수(FUSION_MODE)로 하위호환.
+        self.declare_parameter('fusion_mode', self.FUSION_MODE)
+        self._gps_course_heading = None   # [v5.8.1] gps_course_only 모드용 연속 GPS 코스헤딩
+        self._apply_fusion_mode(self.get_parameter('fusion_mode').value)
+
+        # ── [v5.8.2] 카메라 헤딩보정 ON/OFF 노브 ────────────────────────────
+        # 클래스 상수(CAM_HEAD_ENABLE)를 파라미터로 승격 — prompt.py 메뉴 7 비교주행이
+        # /gps_imu_node/set_parameters 로 런타임 전환한다. 최초값은 상수라 하위호환.
+        # CAM_HEAD_SIGN(+1.0)은 2026-07-16 map_check_fusion 실측으로 확정됨(상수 주석 참조).
+        #   노브는 이제 ON/OFF A/B 비교주행·게인 튜닝용으로 유지한다.
+        self.declare_parameter('cam_head_enable', self.CAM_HEAD_ENABLE)
+        self.CAM_HEAD_ENABLE = bool(self.get_parameter('cam_head_enable').value)
+        # [2026-07-29] 트러스트도 파라미터로 승격 — 재빌드 없이 0.5/0.2/0.0 sweep 가능.
+        #   ros2 param set /gps_imu_node cam_heading_trust 0.5
+        #   ON/OFF(cam_head_enable)보다 세밀한 A/B 가 되고, 같은 주행 안에서도 바꿔볼 수 있다.
+        self.declare_parameter('cam_heading_trust', self.CAM_HEADING_TRUST)
+        self.CAM_HEADING_TRUST = max(0.0, float(self.get_parameter('cam_heading_trust').value))
+
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         # 위치
         self.origin_lat, self.origin_lon = None, None
@@ -300,6 +422,8 @@ class GpsImuNode(Node):
         self.heading_lock_odom_dist = 0.0
         self.heading_lock_last_time = None
         self.heading_lock_buf = []
+        self.heading_lock_imu_buf = []   # [v5.8.1] lock 창 IMU unwrap 헤딩(직진 게이트용)
+        self._imu_gate_block_since = None   # [v5.8.1] IMU 게이트 단독 차단 지속시간(타임아웃 폴백용)
 
         # 헤딩
         self.raw_imu_yaw         = 0.0
@@ -369,23 +493,45 @@ class GpsImuNode(Node):
         # 지형
         self.terrain_code = 0.0
 
+        # [카메라 융합] /lane_metrics 수신 상태
+        self.cam_theta      = 0.0    # [deg] 차선 대비 헤딩오차(CCW+)
+        self.cam_cte_rear   = 0.0    # [m]  뒷차축 투영 CTE(우측+)
+        self.cam_conf       = 0.0    # 유효 conf(게이트 반영)
+        self.cam_flags      = 0.0
+        self.cam_seq        = 0.0
+        self.cam_time       = 0.0    # 마지막 수신 time.time()
+        self.last_cam_head_correct = 0.0
+        self.cam_head_count = 0
+        self.cam_head_total = 0.0
+        self._cam_head_applied = 0.0  # 이번 발행분(디버그)
+
         # 퍼블리셔/서브스크라이버
         self.create_subscription(NavSatFix, "/fix",      self.cb_fix,     10)
         self.create_subscription(Imu,       "/imu/data", self.cb_imu,     10)
         self.create_subscription(Int32,     "/encoder",  self.cb_encoder, 10)
+        # [카메라 융합] camera_judgment 가 발행하는 미터단위 차선계측
+        self.create_subscription(Float32MultiArray, "/lane_metrics",
+                                 self.cb_lane_metrics, 10)
 
         self.ego_pub     = self.create_publisher(Float64MultiArray, "/ego_state",     10)
         self.gps_st_pub  = self.create_publisher(String,            "/gps_status",    10)
         self.heading_pub = self.create_publisher(Float64MultiArray, "/heading",       10)
         self.terrain_pub = self.create_publisher(Float64MultiArray, "/terrain_state", 10)
+        # [카메라 융합] 헤딩보정 검증용 텔레메트리(섀도/실융합 사후분석)
+        self.fusion_debug_pub = self.create_publisher(Float32MultiArray, "/fusion_debug", 10)
+        # [v5.8.1] 현재 융합설정을 rosbag에 자동 기록(비교실험 사후분석용).
+        #   시작 시 1회 + fusion_mode 파라미터 변경 시마다 재발행.
+        self.fusion_config_pub = self.create_publisher(String, "/fusion_config", 10)
 
         self._publish_heading_now()
         self.create_timer(0.05, self.main_loop)
+        self._publish_fusion_config()
 
         self.get_logger().info(
-            f"[GPS-IMU v5.8 | 융합설정] mode={self._fusion_mode} "
+            f"[GPS-IMU v5.8.1 | 융합설정] mode={self._fusion_mode} "
             f"POS_GPS_ALPHA={self._pos_gps_alpha:.2f} "
             f"HEADING_GPS_TRUST={self._heading_gps_trust:.2f} "
+            f"헤딩소스={self._heading_source} "
             f"(위치융합={'연속 α-상보필터' if self._pos_fusion_active else '레거시(GPS직접+DR폴백)'}, "
             f"투영={'ON' if self._project_enabled else 'OFF'}, "
             f"DR폴백={'ON' if self._dr_fallback_enabled else 'OFF'})")
@@ -400,6 +546,15 @@ class GpsImuNode(Node):
             f"연속보정: gain={self.CONT_CORRECT_GAIN} "
             f"max_gyro={math.degrees(self.CONT_CORRECT_MAX_GYRO):.0f}°/s "
             f"min_drift={self.CONT_CORRECT_MIN_DRIFT_DEG}°")
+        _gps_eff = self.HEADING_GPS_TRUST * self.CAM_GPS_TRUST_SCALE
+        self.get_logger().info(
+            f"[카메라 융합] CAM_HEAD={'ON' if self.CAM_HEAD_ENABLE else 'OFF'} "
+            f"카메라 신선 시 IMU:GPS:Cam≈9:{_gps_eff:.1f}:{self.CAM_HEADING_TRUST:.1f}, "
+            f"두절 시 GPS={self.HEADING_GPS_TRUST:.1f}(회수)/DR 시 Cam={self.CAM_HEADING_TRUST_DR:.1f} | "
+            f"gain={self.CAM_HEAD_GAIN} sign={self.CAM_HEAD_SIGN:+.0f} "
+            f"직진게이트 gyro≤{math.degrees(self.CAM_HEAD_MAX_GYRO):.0f}°/s "
+            f"conf≥{self.CAM_HEAD_CONF_MIN} | 부호 실측확정(2026-07-16, "
+            f"slope=-0.45 R²=0.68)")
 
     def _publish_heading_now(self):
         msg = Float64MultiArray()
@@ -407,9 +562,105 @@ class GpsImuNode(Node):
         self.heading_pub.publish(msg)
 
     # =========================================================================
+    # [v5.8.1] 융합 모드 적용 — ROS2 파라미터로 런타임 전환 가능
+    # =========================================================================
+    def _apply_fusion_mode(self, mode_str):
+        """프리셋 → 실효 파라미터. __init__ 최초 1회 + fusion_mode 파라미터
+        변경 시(prompt.py의 GPS단독/IMU단독 비교주행 노브)마다 호출됨.
+        헤딩 lock 여부·yaw_offset·위치는 건드리지 않음(주행 중 전환해도 연속성 유지;
+        운영상으로는 정지 상태에서 전환 권장)."""
+        _mode = str(mode_str).lower()
+        if _mode == "gps_raw":
+            # GPS 원시 바이패스: 위치=GPS 그대로, 헤딩=IMU(보정 없이 lock 시 offset 동결)
+            self._pos_gps_alpha     = 1.0
+            self._heading_gps_trust = 0.0
+            self._heading_source    = "imu"
+        elif _mode == "dr_only":
+            # IMU 단독(=엔코더+자이로 DR): lock 이후 GPS 미개입, 속도는 엔코더
+            self._pos_gps_alpha     = 0.0
+            self._heading_gps_trust = 0.0
+            self._heading_source    = "imu"
+        elif _mode == "gps_course_only":
+            # [v5.8.1] GPS 단독: 위치뿐 아니라 헤딩도 GPS 코스(atan2 변위, LPF)로 산출.
+            # gps_raw는 헤딩이 사실상 IMU라 진짜 'GPS만'이 아니었던 문제를 해결.
+            self._pos_gps_alpha     = 1.0
+            self._heading_gps_trust = 0.0
+            self._heading_source    = "gps_course"
+        else:
+            _mode = "fused"
+            self._pos_gps_alpha     = max(0.0, min(1.0, float(self.POS_GPS_ALPHA)))
+            self._heading_gps_trust = max(0.0, float(self.HEADING_GPS_TRUST))
+            self._heading_source    = "imu"
+
+        # [v5.8.1] 세 비교모드 전부 뒷차축 투영 통일(기준점 일치 → CTE 등 지표 비교 가능).
+        # drift 측정용 안테나 원시좌표(_ant_prev_*)는 이와 별도로 계속 유지되므로 무관.
+        self._project_enabled = True
+        self._fusion_mode = _mode
+        # α<1 이면 연속 상보필터: cb_encoder가 DR 예측을 상시 적분, fix마다 α-당김.
+        self._pos_fusion_active   = self._pos_gps_alpha < 1.0
+        self._dr_fallback_enabled = (not self._pos_fusion_active) and _mode not in ("gps_raw", "gps_course_only")
+
+    def _on_set_parameters(self, params):
+        for p in params:
+            if p.name == 'fusion_mode':
+                old = getattr(self, '_fusion_mode', None)
+                self._apply_fusion_mode(p.value)
+                self.get_logger().warn(
+                    f"[헤딩lock 등 초기화 없음] fusion_mode 전환: {old} → {self._fusion_mode} "
+                    f"(정지 상태에서 전환 권장; 주행 중 전환 시 위치/헤딩은 연속 유지됨)")
+                self._publish_fusion_config()
+            elif p.name == 'cam_head_enable':
+                old_cam = self.CAM_HEAD_ENABLE
+                self.CAM_HEAD_ENABLE = bool(p.value)
+                self.get_logger().warn(
+                    f"[카메라 융합] CAM_HEAD_ENABLE 전환: "
+                    f"{'ON' if old_cam else 'OFF'} → {'ON' if self.CAM_HEAD_ENABLE else 'OFF'} "
+                    f"(OFF 시 카메라 헤딩보정 없이 GPS+IMU 만으로 주행)")
+                self._publish_fusion_config()
+            elif p.name == 'cam_heading_trust':
+                old_t = self.CAM_HEADING_TRUST
+                self.CAM_HEADING_TRUST = max(0.0, float(p.value))
+                self.get_logger().warn(
+                    f"[카메라 융합] CAM_HEADING_TRUST 전환: {old_t:.2f} → "
+                    f"{self.CAM_HEADING_TRUST:.2f} (정상주행 카메라 헤딩보정 권한)")
+                self._publish_fusion_config()
+        return SetParametersResult(successful=True)
+
+    def _publish_fusion_config(self):
+        if not hasattr(self, 'fusion_config_pub'):
+            return
+        # cam_head 는 반드시 포함할 것 — 이 토픽의 존재 이유가 "이 로스백이 어떤 융합
+        # 설정으로 찍혔는지" 사후에 아는 것이다. 빠지면 카메라 헤딩보정 OFF 비교주행
+        # (prompt 메뉴 7)이 일반 주행과 로스백상 구별되지 않는다.
+        self.fusion_config_pub.publish(String(data=(
+            f"mode={self._fusion_mode} pos_gps_alpha={self._pos_gps_alpha:.2f} "
+            f"heading_gps_trust={self._heading_gps_trust:.2f} "
+            f"heading_source={self._heading_source} "
+            f"dr_fallback={'ON' if self._dr_fallback_enabled else 'OFF'} "
+            f"cam_head={'ON' if self.CAM_HEAD_ENABLE else 'OFF'} "
+            # [2026-07-29] 트러스트 값도 남긴다 — ON/OFF 만으로는 0.5 주행과 0.2 주행이
+            #   로스백에서 구별되지 않아 A/B 판정을 할 수 없다.
+            f"cam_trust={self.CAM_HEADING_TRUST:.2f}")))
+
+    # =========================================================================
     # 엔코더 콜백
     # =========================================================================
     def cb_encoder(self, msg: Int32):
+        """/encoder — ★[kasa] A보드 좌+우 펄스의 합(부호 없음, 20ms 창)★ 20Hz 도착.
+
+        ★ 속도는 '고정 창(ENC_DT)' 으로, 거리는 '실측 도착 간격(enc_dt)' 으로 계산한다 ★
+        이 구분이 원래 설계의 핵심이고, 그래서 발행 주기가 10ms→50ms 로 바뀌어도 거리
+        적분은 자동으로 맞는다. 창 크기 상수(ENC_DT)만 정확하면 된다.
+
+        ⚠️ 다만 kasa 에는 원리적인 측정 공백이 남는다: 펄스 필드는 '직전 20ms 창'의
+           카운트인데 보고는 50ms 마다다 → 50ms 중 30ms 는 계측되지 않는다. 여기서
+           '그 순간 속도가 50ms 동안 유지됐다'고 가정해 적분하므로, 급가감속 구간에서
+           DR 거리에 오차가 생긴다. (A보드 펌웨어에 누적 카운터를 넣지 않기로 결정했으므로
+           감수한다. 넣게 되면 여기서 차분/시간으로 정확히 계산할 수 있다.)
+
+        ★ 후진이 없다 ★ kasa 는 후진을 수동조종으로만 하고 A보드가 부호 없는 카운트를
+        보내므로 current_speed_dir 은 항상 +1 로 고정된다. 아래 부호 분기는 코드 형태만
+        남겨 둔다(펌웨어에 방향 필드가 생기면 그대로 되살아난다)."""
         raw = float(msg.data)
 
         now_enc = time.time()
@@ -420,9 +671,12 @@ class GpsImuNode(Node):
             enc_dt = max(0.001, min(now_enc - self.heading_lock_last_time, 0.1))
         self.heading_lock_last_time = now_enc
 
-        if abs(raw) >= 1.0 and not self.encoder_active:
+        if abs(raw) >= self.ENCODER_ACTIVE_MIN_COUNT and not self.encoder_active:
             self.encoder_active = True
-            self.get_logger().info("✅ 엔코더 활성 — 실제 이동 감지, 헤딩 고정 허용")
+            self.get_logger().info(
+                f"✅ 엔코더 활성 — 실제 이동 감지, 헤딩 고정 허용 "
+                f"(≥{self.ENCODER_ACTIVE_MIN_COUNT:.0f}카운트 = "
+                f"{ku.encoder_count_to_ms(self.ENCODER_ACTIVE_MIN_COUNT):.2f}m/s)")
         if raw > 0:
             self.current_speed_dir = 1.0
         elif raw < 0:
@@ -430,7 +684,7 @@ class GpsImuNode(Node):
         speed_signed = (abs(raw) / self.TICKS_PER_REV) * self.WHEEL_CIRCUMFERENCE / self.ENC_DT
         speed_signed *= self.current_speed_dir
 
-        if not self.is_heading_locked and abs(raw) >= 1.0:
+        if not self.is_heading_locked and abs(raw) >= self.ENCODER_ACTIVE_MIN_COUNT:
             self.heading_lock_odom_dist += abs(speed_signed) * enc_dt
 
         with self._lock:
@@ -655,7 +909,8 @@ class GpsImuNode(Node):
         # ── [v5.7] 안테나 → 뒷차축 투영 ──────────────────────────────────
         # rear = antenna − d·[cosψ, sinψ]  (헤딩 고정 후에만; 고정 전엔 원시 좌표)
         # /ego_state는 이 뒷차축 좌표를 발행 → PP·DR·mapping 기하 전부 정합.
-        # [v5.8] gps_raw 모드는 투영 없이 안테나 원시좌표 발행(_project_enabled=False)
+        # [v5.8.1] fused/gps_raw/dr_only/gps_course_only 네 모드 전부 투영 통일
+        # (기준점이 다르면 CTE 등 비교지표가 모드 차이가 아니라 좌표계 차이로 왜곡됨).
         if self.is_heading_locked and self._project_enabled:
             _hr = math.radians(self.heading)
             rear_x = curr_x - self.ANTENNA_AHEAD_REAR_M * math.cos(_hr)
@@ -678,8 +933,10 @@ class GpsImuNode(Node):
 
             if dist >= 0.25:
                 self.heading_lock_buf.append(gps_heading)
+                self.heading_lock_imu_buf.append(self.raw_imu_yaw_unwrap)
                 if len(self.heading_lock_buf) > self.HEADING_LOCK_BUF_SIZE:
                     self.heading_lock_buf.pop(0)
+                    self.heading_lock_imu_buf.pop(0)
 
             if len(self.heading_lock_buf) >= 3:
                 base = self.heading_lock_buf[-1]
@@ -687,18 +944,46 @@ class GpsImuNode(Node):
             else:
                 heading_spread = 999.0
 
-            can_lock_by_encoder = (
+            # [v5.8.1] IMU 직진 게이트(AND): GPS spread가 못 거르는 오염원 차단.
+            #   ① 순간 요레이트: 회전 중 lock 금지 (drift 보정 게이트와 동일 패턴)
+            #   ② 창 전체 IMU 헤딩 변화: 완만한 선회로 코드방향 spread가 한도 안에
+            #      머무는 경우 차단. IMU 미수신 시엔 0으로 남아 기존과 동일 동작.
+            gyro_ok_lock = self.gyro_z_abs_lpf < math.radians(self.HEADING_LOCK_GYRO_MAX_DPS)
+            if len(self.heading_lock_imu_buf) >= 3:
+                imu_span = max(self.heading_lock_imu_buf) - min(self.heading_lock_imu_buf)
+            else:
+                imu_span = 999.0
+            imu_straight = gyro_ok_lock and imu_span <= self.HEADING_LOCK_IMU_SPAN_DEG
+
+            can_lock_by_encoder_base = (
                 self.encoder_active and
                 self.heading_lock_odom_dist >= self.HEADING_LOCK_ENCODER_DIST and
                 abs(self.current_speed_ms) >= self.HEADING_LOCK_MIN_SPEED and
                 dist >= self.HEADING_LOCK_DIST and
                 heading_spread <= self.HEADING_LOCK_SPREAD_DEG
             )
-
-            can_lock_by_gps_only = (
+            can_lock_by_gps_only_base = (
                 dist >= self.GPS_ONLY_HEADING_LOCK_DIST and
                 heading_spread <= self.GPS_ONLY_HEADING_SPREAD_DEG
             )
+
+            # [v5.8.1] 탈출구: IMU 게이트 외 다른 조건은 이미 충족된 채로
+            # HEADING_LOCK_IMU_GATE_TIMEOUT_S 이상 지속되면 IMU 게이트만 우회.
+            imu_gate_blocking = (can_lock_by_encoder_base or can_lock_by_gps_only_base) and not imu_straight
+            if imu_gate_blocking:
+                if self._imu_gate_block_since is None:
+                    self._imu_gate_block_since = now
+                elif now - self._imu_gate_block_since > self.HEADING_LOCK_IMU_GATE_TIMEOUT_S:
+                    imu_straight = True
+                    self.get_logger().warn(
+                        f"[헤딩lock] IMU 직진게이트 {self.HEADING_LOCK_IMU_GATE_TIMEOUT_S:.0f}s 초과 "
+                        f"차단 지속 → 우회 (gyro={math.degrees(self.gyro_z_abs_lpf):.1f}°/s, "
+                        f"span={imu_span:.1f}°) — 노면진동/자이로 임계값 재검토 필요")
+            else:
+                self._imu_gate_block_since = None
+
+            can_lock_by_encoder = can_lock_by_encoder_base and imu_straight
+            can_lock_by_gps_only = can_lock_by_gps_only_base and imu_straight
 
             if can_lock_by_encoder or can_lock_by_gps_only:
                 lock_mode = "ENC+GPS" if can_lock_by_encoder else "GPS-only"
@@ -711,13 +996,17 @@ class GpsImuNode(Node):
                     f"[헤딩 고정:{lock_mode}] {self.locked_heading:.2f}°  "
                     f"(GPS이동={dist:.2f}m, ENC누적={self.heading_lock_odom_dist:.2f}m, "
                     f"속도={self.current_speed_ms:.2f}m/s, spread={heading_spread:.1f}°, "
+                    f"IMU직진 gyro={math.degrees(self.gyro_z_abs_lpf):.1f}°/s span={imu_span:.1f}°, "
                     f"IMU_unwrap={self.raw_imu_yaw_unwrap:.2f}°, offset={self.yaw_offset:.2f}°)")
             else:
                 self.get_logger().info(
                     f"[헤딩 대기] GPS={dist:.2f}/{self.HEADING_LOCK_DIST:.2f}m "
                     f"ENC={self.heading_lock_odom_dist:.2f}/{self.HEADING_LOCK_ENCODER_DIST:.2f}m "
                     f"속도={abs(self.current_speed_ms):.2f}/{self.HEADING_LOCK_MIN_SPEED:.2f}m/s "
-                    f"spread={heading_spread:.1f}/{self.HEADING_LOCK_SPREAD_DEG:.1f}°(ENC) / {self.GPS_ONLY_HEADING_SPREAD_DEG:.1f}°(GPS-only)",
+                    f"spread={heading_spread:.1f}/{self.HEADING_LOCK_SPREAD_DEG:.1f}°(ENC) / {self.GPS_ONLY_HEADING_SPREAD_DEG:.1f}°(GPS-only) "
+                    f"IMU직진={'OK' if imu_straight else 'X'}"
+                    f"(gyro={math.degrees(self.gyro_z_abs_lpf):.1f}/{self.HEADING_LOCK_GYRO_MAX_DPS:.0f}°/s "
+                    f"span={min(imu_span, 99.9):.1f}/{self.HEADING_LOCK_IMU_SPAN_DEG:.0f}°)",
                     throttle_duration_sec=1.0)
 
         with self._lock:
@@ -830,10 +1119,11 @@ class GpsImuNode(Node):
                         else:
                             # [v5.4] gain 매우 약하게. 코너 중 GPS 진행방향을 실제 drift로 오인하지 않도록 보수화
                             # [v5.8] HEADING_GPS_TRUST로 반영 강도 스케일(1.0=현행)
+                            # [카메라 융합] 카메라 신선 시 GPS 몫을 절반으로(9:0.5:0.5), 두절 시 1.0 회수
                             gain = min(self.DRIFT_CORRECT_GAIN_MAX,
                                        self.DRIFT_CORRECT_GAIN_BASE
                                        + abs(drift) / self.DRIFT_CORRECT_GAIN_SCALE)
-                            gain *= self._heading_gps_trust
+                            gain *= self._gps_trust_now()
                             correction = drift * gain
                             self.yaw_offset = normalize_angle(self.yaw_offset - correction)
                             self.drift_correct_count += 1
@@ -847,6 +1137,23 @@ class GpsImuNode(Node):
                                 f"skip={self.drift_skipped_gyro}회)",
                                 throttle_duration_sec=1.0)
                 self.last_drift_correct_time = now
+
+        # [v5.8.1] 연속 GPS 코스헤딩 갱신 — gps_course_only 모드 전용이지만
+        #   모드 무관 항상 계산(저비용, 모드 전환 시 바로 쓸 수 있게 대기).
+        #   drift 측정과 동일하게 안테나 원시좌표 변위 사용(자기참조 방지).
+        if self._ant_prev_x is not None:
+            _cdx = curr_x - self._ant_prev_x
+            _cdy = curr_y - self._ant_prev_y
+            if math.hypot(_cdx, _cdy) >= self.GPS_COURSE_MIN_DIST_M:
+                _course = math.degrees(math.atan2(_cdy, _cdx))
+                if self.current_speed_ms < 0:
+                    _course = normalize_angle(_course + 180.0)
+                if self._gps_course_heading is None:
+                    self._gps_course_heading = _course
+                else:
+                    _dh = normalize_angle(_course - self._gps_course_heading)
+                    self._gps_course_heading = normalize_angle(
+                        self._gps_course_heading + self.GPS_COURSE_LPF_ALPHA * _dh)
 
         # [v5.7] drift 측정용 안테나 원시좌표 갱신(매 유효 fix, 5Hz 스텝 변위 확보)
         self._ant_prev_x = curr_x
@@ -940,7 +1247,8 @@ class GpsImuNode(Node):
             return
 
         # [v5.8] HEADING_GPS_TRUST로 반영 강도 스케일(1.0=현행)
-        correction = drift * self.CONT_CORRECT_GAIN * self._heading_gps_trust
+        # [카메라 융합] 카메라 신선 시 GPS 몫 절반(9:0.5:0.5), 두절 시 1.0 회수
+        correction = drift * self.CONT_CORRECT_GAIN * self._gps_trust_now()
         self.yaw_offset = normalize_angle(self.yaw_offset - correction)
 
         self.cont_correct_count += 1
@@ -954,6 +1262,112 @@ class GpsImuNode(Node):
                 f"→ −{correction:+.3f}° "
                 f"(win={move_dist_total:.2f}m spread={spread:.1f}° "
                 f"누적={self.cont_correct_count}회 {self.cont_correct_total:.2f}°)")
+
+    # =========================================================================
+    # [카메라 융합] /lane_metrics 수신 + 차선기반 헤딩 보정
+    # =========================================================================
+    def cb_lane_metrics(self, msg: Float32MultiArray):
+        d = msg.data
+        if len(d) < 7:
+            return
+        self.cam_cte_rear = float(d[0])
+        self.cam_theta    = float(d[2])   # theta_lane_deg, CCW+
+        self.cam_conf     = float(d[4])   # 게이트 반영 유효 conf(치명 실패 시 0)
+        self.cam_flags    = float(d[6])
+        self.cam_seq      = float(d[9]) if len(d) >= 10 else 0.0
+        self.cam_time     = time.time()
+
+    def _cam_fresh(self):
+        """카메라 계측이 신선하고 conf 게이트 통과 중인가(헤딩보정에 실제 기여 중).
+
+        [2026-07-15] 속도 게이트를 같이 본다 — 이 함수의 유일한 소비자인 _gps_trust_now()
+        가 '카메라가 기여 중이면 GPS 몫을 절반으로'(9:0.5:0.5) 낮추는데, 정지 중엔
+        카메라가 기여하지 않으므로 GPS 를 깎으면 9:0.5:0 이 되어 헤딩보정 총량만 준다.
+        설계 주석의 대칭 degrade 규약("카메라 두절/미사용 시 GPS 1.0 회수")을 지킨다.
+        """
+        if not self.CAM_HEAD_ENABLE:
+            return False
+        if abs(self.current_speed_ms) < self.CAM_HEAD_MIN_SPEED:
+            return False
+        return ((time.time() - self.cam_time) <= self.CAM_HEAD_MAX_AGE
+                and self.cam_conf >= self.CAM_HEAD_CONF_MIN)
+
+    def _gps_trust_now(self):
+        """GPS 헤딩보정 실효 강도. 카메라 신선 시 절반으로 낮춰 9:0.5:0.5,
+        카메라 두절/미사용 시 원래 HEADING_GPS_TRUST(1.0) 회수 = GPS 단독 무손상."""
+        base = self._heading_gps_trust
+        if self._cam_fresh():
+            return base * self.CAM_GPS_TRUST_SCALE
+        return base
+
+    def _apply_cam_heading_correction(self, now):
+        """직진 구간에서 theta_lane 을 0 으로 당겨 IMU 헤딩 drift 억제.
+        GPS 연속미세보정과 동일 철학(직선에서만·저게인). 지도 접선 불필요.
+        정상주행 trust=CAM_HEADING_TRUST, GPS 단절(DR) 시 trust=CAM_HEADING_TRUST_DR."""
+        self._cam_head_applied = 0.0
+        if not self.CAM_HEAD_ENABLE or not self.is_heading_locked:
+            return
+        # 신선도·conf 게이트
+        if (now - self.cam_time) > self.CAM_HEAD_MAX_AGE:
+            return
+        if self.cam_conf < self.CAM_HEAD_CONF_MIN:
+            return
+        # 정지 게이트 — 되먹임이 차량의 물리적 움직임으로 닫히므로, 정지 중엔 theta 가
+        #   상수로 남아 보정이 무한 적분된다(상수 주석의 실측 참조). 자이로 게이트는
+        #   정지(ω≈0)를 직진으로 오인하므로 이 게이트가 따로 필요하다.
+        if abs(self.current_speed_ms) < self.CAM_HEAD_MIN_SPEED:
+            return
+        # [후진] 후진 중엔 전방 카메라가 진행 반대편을 보므로 theta 로 헤딩을 당기면 반대로
+        #   틀어진다 → 후진 전 구간 카메라 헤딩보정 제외(연속미세보정 line 1127 과 동일 규약).
+        #   후진 정밀기동의 헤딩 보정은 추후 라이다 융합으로 대체 예정.
+        if self.current_speed_ms < 0:
+            return
+        # 직진 게이트(회전 중엔 theta 가 곡률 오염 → 금지)
+        if self.gyro_z_abs_lpf > self.CAM_HEAD_MAX_GYRO:
+            return
+        if (now - self.last_cam_head_correct) < self.CAM_HEAD_INTERVAL:
+            return
+
+        theta = self.cam_theta
+        abs_th = abs(theta)
+        if abs_th < self.CAM_HEAD_MIN_DEG or abs_th > self.CAM_HEAD_MAX_DEG:
+            return
+
+        trust = self.CAM_HEADING_TRUST_DR if self.dr_active else self.CAM_HEADING_TRUST
+        # 정렬: yaw_offset += gain·theta (theta=지도접선−헤딩, CCW+). 부호는 노브로 조정.
+        corr = self.CAM_HEAD_SIGN * self.CAM_HEAD_GAIN * trust * theta
+        corr = max(-self.CAM_HEAD_MAX_STEP_DEG, min(self.CAM_HEAD_MAX_STEP_DEG, corr))
+        self.yaw_offset = normalize_angle(self.yaw_offset + corr)
+        # DR 중엔 heading 이 cb_encoder 의 자이로 적분으로 직접 유지되므로(offset 미적용)
+        #   같은 corr 를 heading 에도 반영해야 실제 보정이 걸린다(복귀 시 offset 과 정합).
+        if self.dr_active:
+            self.heading = normalize_angle(self.heading + corr)
+        self.last_cam_head_correct = now
+        self.cam_head_count += 1
+        self.cam_head_total += abs(corr)
+        self._cam_head_applied = corr
+
+    def _publish_fusion_debug(self, now, loop_dt):
+        """카메라 헤딩보정 검증 텔레메트리(경량). rosbag→map_check_fusion 사후분석용."""
+        cam_age = (now - self.cam_time) if self.cam_time > 0 else 99.0
+        cam_fresh = cam_age <= self.CAM_HEAD_MAX_AGE and self.cam_conf >= self.CAM_HEAD_CONF_MIN
+        m = Float32MultiArray()
+        m.data = [
+            1.0 if cam_fresh else 0.0,        # 0 cam_ok
+            float(self.cam_cte_rear),         # 1 cam_cte_rear
+            float(self.cam_theta),            # 2 theta_lane_deg
+            float(self.cam_conf),             # 3 cam_conf
+            float(min(cam_age, 99.0)),        # 4 cam_age_s
+            float(self.cam_flags),            # 5 flags
+            1.0 if self.dr_active else 0.0,   # 6 dr_active
+            float(self._cam_head_applied),    # 7 이번 보정량 [deg]
+            float(self.cam_head_count),       # 8 누적 보정횟수
+            float(self.cam_head_total),       # 9 누적 보정량 [deg]
+            float(self.heading),              # 10 현재 헤딩
+            float(self.yaw_offset),           # 11 현재 offset
+            float(loop_dt),                   # 12 loop_dt
+        ]
+        self.fusion_debug_pub.publish(m)
 
     # =========================================================================
     # 메인 루프 (20Hz)
@@ -1031,16 +1445,35 @@ class GpsImuNode(Node):
         # 기존 코드는 heading lock 전 return 때문에 sensor_monitor에서 GPS 상태가 안 보일 수 있었다.
         e   = GPS_STATUS_EMOJI.get(self.gps_status, "?")
         lbl = GPS_STATUS_LABEL.get(self.gps_status, "UNKNOWN")
-        dr_str    = " [DR중]"   if self.dr_active       else ""
+        # [추측항법] 위치가 실제 DR 로 굴러가는 상태 = dr_active(RTK손실) OR dr_only(α=0)+헤딩고정.
+        #   dr_only 는 gps_imu 내부 dr_active 를 안 켠다(α상보필터가 상시 DR). 그래서 여기서
+        #   '[DR중]' 을 붙여줘야 driving 이 dr_speed_factor(0.6×) 감속 + min_speed 하한면제를
+        #   건다(driving:1736). α=1.0 인 fused/gps_raw/gps_course_only 엔 안 붙음.
+        #   ※ 내부 self.dr_active 는 안 건드리므로 카메라 트러스트(0.5)·적분경로는 그대로.
+        pos_dr    = self.dr_active or (self._pos_gps_alpha <= 0.0 and self.is_heading_locked)
+        dr_str    = " [DR중]"   if pos_dr else ""
         blend_str = " [GPS복구중]" if self.gps_blend_active else ""
-        self.gps_st_pub.publish(String(data=f"{e} {lbl}{dr_str}{blend_str}"))
+        # [추측항법] 초기 헤딩 고정(=시작점 확정) 여부. prompt 의 DR+카메라 모드가 이 플래그로
+        #   "시작점 확정 후 GPS 두절" 을 안내한다. 기존 substring 파서(driving)엔 무영향(추가 텍스트).
+        lock_str  = " [헤딩고정]" if self.is_heading_locked else " [헤딩대기]"
+        self.gps_st_pub.publish(String(data=f"{e} {lbl}{dr_str}{blend_str}{lock_str}"))
 
         if not self.is_heading_locked or self.origin_lat is None:
             return
 
-        # ── 헤딩 업데이트 (bias 보정된 raw_yaw + offset) ─────────────────
+        # ── 헤딩 업데이트 ──────────────────────────────────────────────
+        # [카메라 융합] 차선기반 헤딩 보정(직진구간). 정상=yaw_offset 당김(아래 raw_heading에
+        #   즉시 반영), DR=heading 직접 보정. GPS 연속미세보정과 동일 철학.
+        self._apply_cam_heading_correction(now)
+
+        # [v5.8.1] gps_course_only 모드: 헤딩소스 = 연속 GPS 코스(atan2 변위, LPF).
+        #   그 외(fused/gps_raw/dr_only) 전부 기존과 동일하게 IMU 적분+offset.
         if not self.dr_active:
-            raw_heading = normalize_angle(self.raw_imu_yaw_unwrap + self.yaw_offset)
+            if self._heading_source == "gps_course":
+                raw_heading = (self._gps_course_heading
+                               if self._gps_course_heading is not None else self.heading)
+            else:
+                raw_heading = normalize_angle(self.raw_imu_yaw_unwrap + self.yaw_offset)
             if self.is_heading_locked:
                 max_delta = self.HEADING_MAX_RATE_DPS * loop_dt
                 delta = normalize_angle(raw_heading - self.heading)
@@ -1073,6 +1506,9 @@ class GpsImuNode(Node):
                       float(spd), 0.0,
                       float(self.imu_pitch_deg), float(self.terrain_code)]
         self.ego_pub.publish(state)
+
+        # [카메라 융합] 헤딩보정 검증 텔레메트리
+        self._publish_fusion_debug(now, loop_dt)
 
         if now - self.last_status_print_time >= 5.0:
             self._print_status()
@@ -1153,7 +1589,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == "__main__":
     main()

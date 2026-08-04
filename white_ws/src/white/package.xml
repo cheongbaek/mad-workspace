@@ -13,6 +13,10 @@
   <depend>sensor_msgs</depend>
   <depend>nav_msgs</depend>
 
+  <!-- 카메라 실행 의존성: usb_cam 노드 + v4l2-ctl(v4l-utils) -->
+  <exec_depend>usb_cam</exec_depend>
+  <exec_depend>v4l-utils</exec_depend>
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

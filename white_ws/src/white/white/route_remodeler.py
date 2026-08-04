@@ -236,6 +236,145 @@ def nearest_direction(rows: List[Dict[str, str]], original_s: List[float], targe
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# [카메라 융합 Phase0] lane_* 컬럼 재투영
+# ═══════════════════════════════════════════════════════════════════════
+LANE_FIELDS = ["lane_cte", "lane_conf", "lane_flags"]
+# [카메라 융합 Phase1] 각도·곡률은 선택(optional) 컬럼 — 구버전 맵(3컬럼)엔 없다.
+#   코어(LANE_FIELDS)와 분리해 감지한다 → 이걸 LANE_FIELDS 에 합치면 구버전 맵이
+#   has_lane_columns=False 로 떨어져 기존 lane_cte 보존까지 깨진다.
+LANE_FIELDS_OPT = ["lane_theta", "lane_curv"]
+LANE_CONF_MIN = 0.5      # 양쪽 차선 검출 하한(perception _soft_confidence 규약)
+LANE_PROJ_WINDOW_M = 3.0  # 원본 폴리라인 투영 탐색창(루프 경로 오투영 방지)
+
+
+def has_lane_columns(rows: List[Dict[str, str]]) -> bool:
+    return bool(rows) and all(k in rows[0] for k in LANE_FIELDS)
+
+
+def has_lane_opt_columns(rows: List[Dict[str, str]]) -> bool:
+    return bool(rows) and all(k in rows[0] for k in LANE_FIELDS_OPT)
+
+
+def build_lane_opt_columns(rows: List[Dict[str, str]], s_list: List[float],
+                           src_s: float, ok: bool) -> Dict[str, str]:
+    """theta/curv 선택 컬럼. cte 처럼 δ(횡변위) 보정이 필요 없다(각도/곡률이라 평행이동
+    불변). 코어 lane 이 무효(ok=False)면 0 — conf=0 행의 각도는 오검출이라 섞으면 안 됨.
+    ⚠️ theta 는 '지도접선−헤딩' 이라, 리모델 스무딩이 접선을 바꾸면 엄밀히는
+       theta -= Δheading 보정이 필요하다. 스무딩 이동이 작아(epsilon~0.08m) 1차
+       근사로 호길이 보간만 한다 — 각도 재보정은 주행측 검증 후 도입(Phase1 TODO)."""
+    if not ok:
+        return {"lane_theta": "0.00", "lane_curv": "0.000000"}
+    return {
+        "lane_theta": f"{interp_numeric(rows, s_list, src_s, 'lane_theta', 0.0):.2f}",
+        "lane_curv":  f"{interp_numeric(rows, s_list, src_s, 'lane_curv', 0.0):.6f}",
+    }
+
+
+def _fnum(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def project_to_polyline(p: Point, pts: List[Point], s_list: List[float],
+                        s_hint: Optional[float] = None,
+                        window_m: float = LANE_PROJ_WINDOW_M) -> Tuple[float, float]:
+    """p 에서 폴리라인에 내린 수선 → (호길이 s, 부호있는 횡변위).
+
+    횡변위 부호는 폴리라인 진행방향 기준 '우측이 +' (발행 cte 규약과 동일).
+    s_hint 가 있으면 그 호길이 ±window_m 안의 세그먼트만 본다 — 루프 경로에서
+    반대편 구간으로 잘못 투영되는 것을 막는다.
+    """
+    if len(pts) < 2:
+        return 0.0, 0.0
+    best_d = float("inf")
+    best_s = 0.0
+    best_off = 0.0
+    for i in range(len(pts) - 1):
+        if s_hint is not None and window_m > 0.0:
+            # 세그먼트가 탐색창에서 완전히 벗어나면 건너뛴다.
+            if s_list[i + 1] < s_hint - window_m or s_list[i] > s_hint + window_m:
+                continue
+        a, b = pts[i], pts[i + 1]
+        ab = sub(b, a)
+        den = dot(ab, ab)
+        if den < 1e-12:
+            continue
+        t = max(0.0, min(1.0, dot(sub(p, a), ab) / den))
+        foot = add(a, mul(ab, t))
+        d = dist(p, foot)
+        if d < best_d:
+            u = unit(ab)
+            # x=동, y=북, heading=atan2(dy,dx) → 좌측법선=(-u_y, u_x), 우측법선=(u_y, -u_x)
+            right_n = (u[1], -u[0])
+            best_d = d
+            best_s = s_list[i] + t * norm(ab)
+            best_off = dot(sub(p, foot), right_n)
+    if best_d == float("inf"):
+        # 탐색창이 비었으면(=hint가 경로 밖) 창 없이 재시도
+        return project_to_polyline(p, pts, s_list, s_hint=None, window_m=0.0)
+    return best_s, best_off
+
+
+def _bracket(original_s: List[float], target_s: float) -> Tuple[int, float]:
+    """target_s 를 감싸는 원본 인덱스 i 와 [i, i+1] 사이 보간계수 u 를 반환."""
+    n = len(original_s)
+    if n < 2:
+        return 0, 0.0
+    target_s = max(0.0, min(original_s[-1], target_s))
+    i = 0
+    while i < n - 2 and original_s[i + 1] < target_s:
+        i += 1
+    s0, s1 = original_s[i], original_s[i + 1]
+    if s1 - s0 <= 1e-9:
+        return i, 0.0
+    return i, (target_s - s0) / (s1 - s0)
+
+
+def build_lane_columns(rows: List[Dict[str, str]], original_s: List[float],
+                       original_xy: List[Point], p: Point,
+                       s_hint: Optional[float] = None) -> Tuple[Dict[str, str], float, bool]:
+    """리모델 점 p 의 lane_* 컬럼을 원본에서 재투영해 만든다. → (컬럼dict, |δ|, 유효여부)
+
+    발행 cte 규약은 '우측+'(차량이 차선중심보다 우측이면 양수). 매핑 차량이 원본점 O 에서
+    lane_cte 를 읽었다면  차선중심 = O − lane_cte·(우측법선)  이므로, 리모델 점 P 에 차량이
+    있을 때 카메라가 읽을 값은
+
+        cte(P) = (P − 차선중심)·우측법선 = (P − O)·우측법선 + lane_cte = δ + lane_cte
+
+    즉 리모델이 경로를 우측으로 δ 옮겼으면 lane_cte 도 δ 만큼 커진다. ★이 보정을 빼먹으면
+    맵(waypoint)은 리모델된 골격선을 가리키는데 lane_cte 는 원본 지그재그를 가리켜, 주행 중
+    횡보정이 차를 리모델 전 궤적으로 도로 끌고 간다 — 리모델링이 무력화된다.
+
+    양끝 표본이 모두 유효(conf≥LANE_CONF_MIN)할 때만 보간한다. 한쪽이 미검출이면 그 행의
+    lane_cte 는 0(더미)이라, 선형보간이 실제값과 0 사이에서 없는 값을 지어낸다.
+    """
+    invalid = ({"lane_cte": "0.0000", "lane_conf": "0.000", "lane_flags": "0"}, 0.0, False)
+    if len(original_xy) < 2 or len(rows) < 2:
+        return invalid
+
+    s_at, delta = project_to_polyline(p, original_xy, original_s, s_hint=s_hint)
+    i, u = _bracket(original_s, s_at)
+    if i + 1 >= len(rows):
+        return invalid
+
+    c0 = _fnum(rows[i].get("lane_conf"), 0.0)
+    c1 = _fnum(rows[i + 1].get("lane_conf"), 0.0)
+    if min(c0, c1) < LANE_CONF_MIN:
+        return invalid
+
+    cte = (1.0 - u) * _fnum(rows[i].get("lane_cte")) + u * _fnum(rows[i + 1].get("lane_cte"))
+    cte += delta
+    flags = int(_fnum(rows[i].get("lane_flags"))) | int(_fnum(rows[i + 1].get("lane_flags")))
+    return ({
+        "lane_cte":   f"{cte:.4f}",
+        "lane_conf":  f"{min(c0, c1):.3f}",
+        "lane_flags": f"{flags}",
+    }, abs(delta), True)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 경로 골격 추출: RDP
 # ═══════════════════════════════════════════════════════════════════════
 def rdp_indices(points: List[Point], epsilon: float) -> List[int]:
@@ -324,6 +463,9 @@ def build_smart_path(
     vehicle_min_radius_m: float = 1.90,   # 차량 물리 최소 선회반경 = L/tan(21°) (L=0.73). 경로는 이보다 더 조이면 추종 불가.
     corner_radius_margin: float = 1.30,   # 위 한계에 곱하는 안전 여유 → 목표 호반경(약 2.47m).
     max_corner_radius_m: float = 6.0,     # 완만한 코너를 과도하게 부풀리지 않도록 호반경 상한.
+    vehicle_width_m: float = 0.775,       # [0713] 실측 차폭. 경로(=뒷차축 중심선) 안쪽으로
+                                           #   차체가 반폭만큼 파고들므로, 코너 목표반경의
+                                           #   물리적 하한(=vehicle_min_radius_m + width/2)으로 사용.
 ) -> Tuple[List[Point], Dict[str, float]]:
     """
     1) 등간격 예비 샘플링
@@ -377,7 +519,12 @@ def build_smart_path(
         #   → R = t / tan(θ/2).  같은 셋백이면 코너가 급할수록(θ↑) 호반경이 더 작아진다.
         # 따라서 "급한 코너일수록 셋백을 더 크게" 줘야 호반경이 차량 최소반경 위로 유지된다.
         # (기존 로직은 급할수록 반경을 줄여서, 차가 못 도는 0.35~0.66m 코너를 만들고 있었음.)
-        target_radius = vehicle_min_radius_m * corner_radius_margin     # 목표 호반경(여유 포함)
+        # [0713] 차폭 반영: 차체는 경로(뒷차축 중심선) 안쪽으로 반폭(width/2)만큼 파고드므로,
+        #   목표호반경이 '차량 최소선회반경+반폭'보다 작아지면 코너 안쪽에서 차체 여유가 없어진다.
+        #   기존 margin(1.30배)이 이미 이 하한보다 크면(현재 2.47m > 2.29m) 동작 변화 없음 —
+        #   margin을 나중에 줄이더라도 이 물리적 하한 아래로는 절대 안 좁아지게 하는 안전장치.
+        min_radius_with_width = vehicle_min_radius_m + vehicle_width_m / 2.0
+        target_radius = max(vehicle_min_radius_m * corner_radius_margin, min_radius_with_width)
         target_radius = min(target_radius, max_corner_radius_m)
         half = 0.5 * math.radians(turn_angle)
         tan_half = math.tan(min(half, math.radians(80.0)))             # 과도한 급각에서 폭주 방지
@@ -458,6 +605,8 @@ def build_smart_path(
         "corners": float(corner_count),
         "straight_segments": float(max(1, straight_count + 1)),
         "rdp_epsilon_m": float(rdp_eps),
+        "vehicle_width_m": float(vehicle_width_m),
+        "min_radius_with_width_m": float(vehicle_min_radius_m + vehicle_width_m / 2.0),
     }
     return remodeled, stats
 
@@ -530,6 +679,16 @@ def _remodel_route_single(
         output_csv = root + "_remodeled.csv"
 
     fieldnames = ["latitude", "longitude", "heading", "speed", "steer", "direction", "pitch", "terrain"]
+    # [카메라 융합] 입력에 lane_* 이 있을 때만 출력에 붙인다 → 구버전 맵의 출력은 바이트 동일.
+    has_lane = has_lane_columns(rows)
+    has_lane_opt = has_lane and has_lane_opt_columns(rows)
+    if has_lane:
+        fieldnames = fieldnames + LANE_FIELDS
+        if has_lane_opt:
+            fieldnames = fieldnames + LANE_FIELDS_OPT
+    lane_ok_count = 0
+    lane_delta_sum = 0.0
+    lane_delta_max = 0.0
 
     out_rows = []
     for i, p in enumerate(remodeled_xy):
@@ -537,7 +696,7 @@ def _remodel_route_single(
         src_s = progress * original_len
         lat, lon = xy_to_latlon(p[0], p[1], lat0, lon0)
         h = heading_deg(remodeled_xy, i)
-        out_rows.append({
+        row_out = {
             "latitude":  f"{lat:.8f}",
             "longitude": f"{lon:.8f}",
             "heading":   f"{h:.2f}",
@@ -546,7 +705,20 @@ def _remodel_route_single(
             "direction": str(nearest_direction(rows, original_s, src_s)),
             "pitch":     f"{interp_numeric(rows, original_s, src_s, 'pitch',  0.0):.2f}",
             "terrain":   f"{interp_numeric(rows, original_s, src_s, 'terrain',0.0):.1f}",
-        })
+        }
+        if has_lane:
+            # lane_* 만 호길이 진행률이 아니라 '수선 투영'으로 원본과 대응시킨다 —
+            # δ(횡변위)를 얻으려면 기하학적 최근접점이 필요하기 때문. 기존 컬럼의
+            # src_s 대응은 그대로 둬서 출력 변화를 lane_* 로만 국한한다.
+            lane_cols, d_abs, ok = build_lane_columns(rows, original_s, original_xy, p, s_hint=src_s)
+            row_out.update(lane_cols)
+            if has_lane_opt:
+                row_out.update(build_lane_opt_columns(rows, original_s, src_s, ok))
+            if ok:
+                lane_ok_count += 1
+                lane_delta_sum += d_abs
+                lane_delta_max = max(lane_delta_max, d_abs)
+        out_rows.append(row_out)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
     with open(output_csv, "w", newline="", encoding="utf-8") as f:
@@ -571,9 +743,22 @@ def _remodel_route_single(
         f.write(f"skeleton_points: {int(stats.get('skeleton_points', 0))}\n")
         f.write(f"straight_segments: {int(stats.get('straight_segments', 0))}\n")
         f.write(f"rounded_corners: {int(stats.get('corners', 0))}\n")
+        f.write(f"vehicle_width_m: {stats.get('vehicle_width_m', 0.0):.3f}\n")
+        f.write(f"min_corner_radius_with_width_m: {stats.get('min_radius_with_width_m', 0.0):.3f}\n")
         f.write("straight_model: exact skeleton line\n")
         f.write("corner_model: cubic Bezier fillet\n")
         f.write("corner_cutting: limited conservative fillet\n")
+        if has_lane:
+            n_out = max(1, len(remodeled_xy))
+            f.write(f"lane_columns: present\n")
+            f.write(f"lane_valid_points: {lane_ok_count}/{n_out} "
+                    f"({100.0*lane_ok_count/n_out:.1f}%)\n")
+            f.write(f"lane_reproject_mean_shift_m: "
+                    f"{(lane_delta_sum/lane_ok_count if lane_ok_count else 0.0):.4f}\n")
+            f.write(f"lane_reproject_max_shift_m: {lane_delta_max:.4f}\n")
+            f.write("lane_model: cte reprojected onto remodeled line (cte += delta, right+)\n")
+        else:
+            f.write("lane_columns: absent (카메라 미기록 맵 — 출력은 구버전과 동일)\n")
 
     print("✅ 스마트 경로 리모델링 완료")
     print(f"입력 파일: {os.path.abspath(os.path.expanduser(input_csv))}")
@@ -583,6 +768,11 @@ def _remodel_route_single(
     print(f"경로 길이: {original_len:.2f}m → {remodeled_len:.2f}m")
     print(f"골격점: {int(stats.get('skeleton_points', 0))}, 직선: {int(stats.get('straight_segments', 0))}, 코너: {int(stats.get('corners', 0))}")
     print(f"간격: {spacing:.2f}m, RDP eps: {stats.get('rdp_epsilon_m', 0.0):.2f}m")
+    if has_lane:
+        n_out = max(1, len(remodeled_xy))
+        print(f"차선: 유효 {lane_ok_count}/{n_out} ({100.0*lane_ok_count/n_out:.1f}%), "
+              f"재투영 이동 평균 {(lane_delta_sum/lane_ok_count if lane_ok_count else 0.0):.3f}m "
+              f"/ 최대 {lane_delta_max:.3f}m")
     return output_csv
 
 
@@ -618,6 +808,13 @@ def _remodel_route_segmented(
     total_skeleton = 0
     rdp_eps_used = 0.0
     original_len_sum = 0.0
+    stats: Dict[str, float] = {}   # run이 전부 <3점이면 루프에서 안 채워질 수 있어 기본값 필요
+    # [카메라 융합] 입력에 lane_* 이 있을 때만 출력에 붙인다 → 구버전 맵의 출력은 바이트 동일.
+    has_lane = has_lane_columns(rows_raw)
+    has_lane_opt = has_lane and has_lane_opt_columns(rows_raw)
+    lane_ok_count = 0
+    lane_delta_sum = 0.0
+    lane_delta_max = 0.0
 
     for run_rows, run_dir in runs:
         # 너무 짧은 run(1~2점)은 깎지 않고 원본 점을 그대로 통과시킨다.
@@ -625,7 +822,7 @@ def _remodel_route_segmented(
             for r in run_rows:
                 x, y = latlon_to_xy(float(r["latitude"]), float(r["longitude"]), lat0, lon0)
                 remodeled_all.append((x, y))
-                out_rows.append({
+                row_out = {
                     "latitude":  f"{xy_to_latlon(x, y, lat0, lon0)[0]:.8f}",
                     "longitude": f"{xy_to_latlon(x, y, lat0, lon0)[1]:.8f}",
                     "heading":   "0.00",
@@ -634,7 +831,27 @@ def _remodel_route_segmented(
                     "direction": str(run_dir),
                     "pitch":     f"{float(r.get('pitch', 0.0) or 0.0):.2f}" if _is_num(r.get('pitch')) else "0.00",
                     "terrain":   f"{float(r.get('terrain', 0.0) or 0.0):.1f}" if _is_num(r.get('terrain')) else "0.0",
-                })
+                }
+                if has_lane:
+                    # 점을 안 옮겼으므로 δ=0 → 원본 lane_* 를 그대로 통과.
+                    conf = _fnum(r.get("lane_conf"), 0.0)
+                    if conf >= LANE_CONF_MIN:
+                        row_out.update({
+                            "lane_cte":   f"{_fnum(r.get('lane_cte')):.4f}",
+                            "lane_conf":  f"{conf:.3f}",
+                            "lane_flags": f"{int(_fnum(r.get('lane_flags')))}",
+                        })
+                        if has_lane_opt:
+                            row_out.update({
+                                "lane_theta": f"{_fnum(r.get('lane_theta')):.2f}",
+                                "lane_curv":  f"{_fnum(r.get('lane_curv')):.6f}",
+                            })
+                        lane_ok_count += 1
+                    else:
+                        row_out.update({"lane_cte": "0.0000", "lane_conf": "0.000", "lane_flags": "0"})
+                        if has_lane_opt:
+                            row_out.update({"lane_theta": "0.00", "lane_curv": "0.000000"})
+                out_rows.append(row_out)
             continue
 
         xy_raw = [latlon_to_xy(float(r["latitude"]), float(r["longitude"]), lat0, lon0) for r in run_rows]
@@ -657,7 +874,7 @@ def _remodel_route_segmented(
             src_s = progress * orig_len
             lat, lon = xy_to_latlon(p[0], p[1], lat0, lon0)
             remodeled_all.append(p)
-            out_rows.append({
+            row_out = {
                 "latitude":  f"{lat:.8f}",
                 "longitude": f"{lon:.8f}",
                 "heading":   "0.00",  # 아래에서 전체 경로 기준으로 채움
@@ -666,7 +883,19 @@ def _remodel_route_segmented(
                 "direction": str(run_dir),  # ★ run 방향 강제(라벨 뭉개짐 방지)
                 "pitch":     f"{interp_numeric(rows_d, orig_s, src_s, 'pitch',  0.0):.2f}",
                 "terrain":   f"{interp_numeric(rows_d, orig_s, src_s, 'terrain',0.0):.1f}",
-            })
+            }
+            if has_lane:
+                # 투영은 반드시 '해당 run' 의 원본 폴리라인에만 — 전/후진이 겹쳐 지나는
+                # 구간에서 반대 방향 run 에 잘못 붙는 것을 막는다.
+                lane_cols, d_abs, ok = build_lane_columns(rows_d, orig_s, orig_xy, p, s_hint=src_s)
+                row_out.update(lane_cols)
+                if has_lane_opt:
+                    row_out.update(build_lane_opt_columns(rows_d, orig_s, src_s, ok))
+                if ok:
+                    lane_ok_count += 1
+                    lane_delta_sum += d_abs
+                    lane_delta_max = max(lane_delta_max, d_abs)
+            out_rows.append(row_out)
 
     # heading은 이어붙인 전체 경로 기준으로 계산(기존과 동일한 방식)
     for i in range(len(out_rows)):
@@ -680,6 +909,10 @@ def _remodel_route_segmented(
         output_csv = root + "_remodeled.csv"
 
     fieldnames = ["latitude", "longitude", "heading", "speed", "steer", "direction", "pitch", "terrain"]
+    if has_lane:
+        fieldnames = fieldnames + LANE_FIELDS
+        if has_lane_opt:
+            fieldnames = fieldnames + LANE_FIELDS_OPT
     os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
     with open(output_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -703,9 +936,22 @@ def _remodel_route_segmented(
         f.write(f"skeleton_points(sum): {total_skeleton}\n")
         f.write(f"straight_segments(sum): {total_straight}\n")
         f.write(f"rounded_corners(sum): {total_corners}\n")
+        f.write(f"vehicle_width_m: {stats.get('vehicle_width_m', 0.0):.3f}\n")
+        f.write(f"min_corner_radius_with_width_m: {stats.get('min_radius_with_width_m', 0.0):.3f}\n")
         f.write("straight_model: exact skeleton line\n")
         f.write("corner_model: cubic Bezier fillet (per direction-run)\n")
         f.write("cusp_handling: forward<->reverse reversal preserved (not filleted)\n")
+        if has_lane:
+            n_out = max(1, len(remodeled_all))
+            f.write("lane_columns: present\n")
+            f.write(f"lane_valid_points: {lane_ok_count}/{n_out} "
+                    f"({100.0*lane_ok_count/n_out:.1f}%)\n")
+            f.write(f"lane_reproject_mean_shift_m: "
+                    f"{(lane_delta_sum/lane_ok_count if lane_ok_count else 0.0):.4f}\n")
+            f.write(f"lane_reproject_max_shift_m: {lane_delta_max:.4f}\n")
+            f.write("lane_model: cte reprojected onto remodeled line (cte += delta, right+)\n")
+        else:
+            f.write("lane_columns: absent (카메라 미기록 맵 — 출력은 구버전과 동일)\n")
 
     print("✅ 스마트 경로 리모델링 완료 [방향 구간 분리]")
     print(f"입력 파일: {os.path.abspath(os.path.expanduser(input_csv))}")
@@ -733,8 +979,8 @@ def main():
     parser = argparse.ArgumentParser(description="GPS waypoint CSV 스마트 리모델링 도구")
     parser.add_argument("--input", "-i", help="입력 route CSV 경로")
     parser.add_argument("--output", "-o", help="출력 CSV 경로")
-    parser.add_argument("--latest", action="store_true", help="~/white_ws/gps_data 안의 최신 route_*.csv 자동 선택")
-    parser.add_argument("--data-dir", default="~/white_ws/gps_data", help="route CSV 폴더")
+    parser.add_argument("--latest", action="store_true", help="~/white_ws/white_ws/gps_data 안의 최신 route_*.csv 자동 선택")
+    parser.add_argument("--data-dir", default="~/white_ws/white_ws/gps_data", help="route CSV 폴더")
     parser.add_argument("--spacing", type=float, default=0.25, help="출력 waypoint 간격[m]")
     parser.add_argument("--epsilon", type=float, default=0.10, help="직선/코너 골격 추출 허용오차[m]")
     parser.add_argument("--smooth", type=int, default=1, help="최종 heading 완화 반복 횟수")

@@ -16,6 +16,11 @@ __pycache__/
 
 # 대용량 백업 압축본 (GitHub 100MB 파일 제한 초과, src는 이미 폴더로 추적됨)
 white_ws0709b.zip
+white_ws/src/white/white.zip
+
+# 이 워크스페이스(ROS2)와 무관한 안드로이드 앱 프로젝트 (241MB, gradle 산출물 포함).
+# 필요해지면 별도 저장소로 분리한다.
+domiman/
 
 # OS
 .DS_Store

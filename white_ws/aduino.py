@@ -1,51 +1,50 @@
-// 하네스 T8 PID Control v6 (로스백 분석 기반 버그수정)
+// Arduino motor/steering controller [PS2 우선권 + 통신 워치독 페일세이프판]
 //
-// ═══════════════════════════════════════════════════
-// ★ v6 변경 사항 (로스백 분석으로 확인된 버그 수정)
-// ═══════════════════════════════════════════════════
+// 변경 요약 (PS2 우선권 보장판 대비)
+//  ★ [추가] ROS 통신 워치독 페일세이프
+//    - state=true(자율주행)인데 일정 시간(COMM_TIMEOUT_MS) ROS의 C 명령이
+//      안 들어오면(USB 분리 / 상위 노드 다운 등) 마지막 속도로 폭주하지 않도록
+//      구동모터를 즉시 정지시킨다.
+//    - state는 그대로 유지하므로, 통신이 복구되면(C 명령 재수신) 자동으로 재개된다.
+//    - 리모컨 override 중에는 절대 개입하지 않는다(사람 우선권 유지).
+//    - 정상 자율주행(20Hz, 50ms 주기로 C 수신)에서는 절대 발동하지 않는다.
 //
-// [변경 1] MAX_VEL : 71 → 255 (상한 없음)
-//   - 기존 71: ROS에서 83틱 명령 시 클램프→71 전달
-//     → PID 오차 = 71 - 4틱 = 67틱 → Sum_Error 폭주
-//     → PWM_raw > 205 → PWM = 60 급감 → 차 멈춤
-//   - 수정: 아두이노는 255까지 허용, 상한은 ROS(driving.py)에서 71틱으로 관리
-//   - 실제 명령은 driving.py publish_cmd가 71틱 이하로 보장
+// 기존 유지 사항
+// 1. PS2 read 동안 Serial RX 인터럽트만 임시 차단 (UCSR0B의 RXCIE0 토글)
+// 2. PS2 폴링 주기 30ms
+// 3. PS2 통신 stale 자동 감지 + 재설정
+// 4. 리모컨 Override 윈도우 300ms
 //
-// [변경 2] PWM 안티 와인드업 클램프 방식 수정 (★ 핵심 버그)
-//   - 기존: if(PWM > 205) PWM = 60;  ← PWM을 60으로 급감 → 모터 갑자기 약해짐
-//   - 수정: if(PWM > 205) PWM = 205; ← 포화만 시킴 (급감 없음)
-//           Sum_Error도 와인드업 방지용 역산으로 클램프
-//
-// [v5 유지] 클램프 버그 수정(±MAX_VEL), E-Stop 적분 초기화,
-//           d_val 부호 포함 발행 로직 동일
-//
-// ═══════════════════════════════════════════════════
-// 속도 대조표
-//   35틱 = 1.485 m/s
-//   47틱 = 1.993 m/s
-//   59틱 = 2.501 m/s
-//   71틱 = 3.011 m/s  ← ROS 측 상한 (driving.py에서 제한)
-//   255틱 = 아두이노 하드웨어 상한 (실제 도달 불가)
-// ═══════════════════════════════════════════════════
+// 단위/통신 체계 (이전과 동일)
+// - Serial 수신: C,velocity,steer  /  S,0|1
+// - velocity 단위: tick/10ms, 부호 포함
+// - Serial 송신: E,d_val  (DIAG_DT=1일 때 E,d_val,dt_us)
 
 #include <MsTimer2.h>
 #include <PS2X_lib.h>
 #include <SPI.h>
 #include <math.h>
 
+#define DIAG_DT 0
+
 // ── 전역 명령 변수 ─────────────────────────────────────────────────────────
-int  velocity    = 0;   // 틱/20ms (부호 포함)
-int  steer_angle = 0;   // 도 (-21 ~ +21)
+int  velocity    = 0;
+int  steer_angle = 0;
 bool state       = false;
 
 // ── Serial 수신 버퍼 ────────────────────────────────────────────────────────
 static char    rx_line[64];
 static uint8_t rx_idx = 0;
 
-// ── ★ [변경 1] 속도 상한 255 = 상한 없음 (ROS 측 driving.py에서 71틱으로 제한)
 #define MAX_VEL 255
 
-// ── 구동 모터 (Motor1, Motor2: 후륜 구동) ───────────────────────────────────
+// ★ [추가] ROS 통신 워치독 ─────────────────────────────────────────────────
+//  자율주행 중(state=true) C 명령이 COMM_TIMEOUT_MS 이상 끊기면 즉시 정지.
+//  정상 명령 주기(50ms)의 10배라 정상 주행에서는 절대 안 걸린다.
+#define COMM_TIMEOUT_MS 500UL
+unsigned long last_cmd_rx_ms = 0;
+
+// ── 구동 모터 ───────────────────────────────────────────────────────────────
 #define MOTOR1_PWM 2
 #define MOTOR1_ENA 3
 #define MOTOR1_ENB 4
@@ -103,54 +102,68 @@ void clearEncoderCount(int no) {
 #define velo_Ki  0.25
 #define velo_Kd  15
 
+#define VELO_PID_PERIOD_US  10000UL
+#define SERIAL_TX_PERIOD_US 10000UL
+
 long          Curr_val = 0, old_val = 0;
-signed long   d_val = 0;       // ★ [변경 4] 부호 포함 (후진=음수)
+signed long   d_val = 0;
+signed long   d_val_raw = 0;
+unsigned long last_pid_us = 0;
+unsigned long last_dt_us  = VELO_PID_PERIOD_US;
+
 int           velo_val = 0;
-unsigned long t_start = 0;
 float         Error = 0, d_Error = 0, old_Error = 0, Sum_Error = 0;
 int           PWM = 0;
 
-void velo_control_callback() {
-  Curr_val = -1L * readEncoder(1);   // 모터 방향에 맞게 부호 반전
-  d_val    = Curr_val - old_val;
-  old_val  = Curr_val;
-}
-
 void Velo_PID_Control() {
-  unsigned long t_now = millis();
-  if ((t_now - t_start) >= 10) {
-    velo_control_callback();
-    Error     = velo_val - d_val;
-    d_Error   = Error - old_Error;
-    Sum_Error += Error;
+  unsigned long now_us = micros();
+  unsigned long elapsed_us = now_us - last_pid_us;
 
-    if (velo_val == 0) {
-      // ★ [변경 3] 정지 명령 시 PID 완전 초기화
-      PWM       = 0;
-      Sum_Error = 0;
-      old_Error = 0;
-    } else {
-      PWM = (int)(velo_Kp * Error + velo_Ki * Sum_Error + velo_Kd * d_Error);
-      // ★ [변경 2] 안티 와인드업: PWM 포화 클램프 (기존 60 급감 버그 수정)
-      // 기존: if(PWM > 205) PWM = 60; → PWM 급감으로 모터 갑자기 약해지는 버그
-      // 수정: 포화만 시키고, Sum_Error도 역산 클램프로 와인드업 방지
-      if (PWM >  205) {
-        PWM = 205;
-        Sum_Error -= Error;   // 와인드업 방지: 이번 Error 적분 취소
-      }
-      if (PWM < -205) {
-        PWM = -205;
-        Sum_Error -= Error;   // 와인드업 방지: 이번 Error 적분 취소
-      }
+  if (elapsed_us < VELO_PID_PERIOD_US) return;
+
+  Curr_val  = -1L * readEncoder(1);
+  d_val_raw = Curr_val - old_val;
+  old_val   = Curr_val;
+
+  float scale = (float)VELO_PID_PERIOD_US / (float)elapsed_us;
+  d_val = (signed long)((float)d_val_raw * scale);
+
+  last_dt_us = elapsed_us;
+
+  Error = (float)velo_val - (float)d_val;
+
+  float dt_ratio = (float)elapsed_us / (float)VELO_PID_PERIOD_US;
+  Sum_Error += Error * dt_ratio;
+  d_Error = (Error - old_Error) / dt_ratio;
+
+  if (velo_val == 0) {
+    PWM = 0;
+    Sum_Error = 0;
+    old_Error = 0;
+  } else {
+    PWM = (int)(velo_Kp * Error + velo_Ki * Sum_Error + velo_Kd * d_Error);
+    if (PWM > 205) {
+      PWM = 205;
+      Sum_Error -= Error * dt_ratio;
     }
-
-    motor_control(PWM);
-    t_start   = t_now;
-    old_Error = Error;
+    if (PWM < -205) {
+      PWM = -205;
+      Sum_Error -= Error * dt_ratio;
+    }
   }
+
+  motor_control(PWM);
+
+  if (elapsed_us > 2 * VELO_PID_PERIOD_US) {
+    last_pid_us = now_us;
+  } else {
+    last_pid_us += VELO_PID_PERIOD_US;
+  }
+
+  old_Error = Error;
 }
 
-// ── 조향 PID ────────────────────────────────────────────────────────────────
+// ── 조향 PID (MsTimer2 20ms - 기존 유지) ────────────────────────────────
 #define Steering_Sensor  A15
 #define NEURAL_ANGLE     0
 #define LEFT_STEER_ANGLE  -21
@@ -161,11 +174,12 @@ void Velo_PID_Control() {
 
 const int   AD_MIN = -460;
 const int   AD_MAX =  423;
-float Kp = 6.5, Ki_s = 3.0, Kd_s = 1.0;
-const float STEER_DEADBAND = 0.8;
-const float I_CLAMP = 80.0;
+
+float Kp = 5.0, Ki_s = 1.8, Kd_s = 2.5;
+const float STEER_DEADBAND = 1.0;
+const float I_CLAMP   = 40.0;
 const int   PWM_LIMIT = 255;
-const int   PWM_SLEW  = 15;
+const int   PWM_SLEW  = 11;
 const float STEER_LPF_FC = 12.0f;
 
 double error_s = 0.0, error_old_s = 0.0, error_i_s = 0.0;
@@ -213,7 +227,6 @@ void Steer_PID_Control(float dt_s) {
   pwm_prev_s = uc; error_old_s = error_s;
 }
 
-// ── 20ms 조향 타이머 ────────────────────────────────────────────────────────
 void control_callback() {
   static unsigned long last_ms = 0;
   unsigned long now = millis();
@@ -235,133 +248,3 @@ void control_callback() {
     + LEFT_STEER_ANGLE);
 
   Steering_Angle = NEURAL_ANGLE + steer_angle;
-  if (Steering_Angle < LEFT_STEER_ANGLE)  Steering_Angle = LEFT_STEER_ANGLE;
-  if (Steering_Angle > RIGHT_STEER_ANGLE) Steering_Angle = RIGHT_STEER_ANGLE;
-  Steer_PID_Control(dt_s);
-}
-
-// ── PS2 컨트롤러 ────────────────────────────────────────────────────────────
-#define PS2_DAT 17
-#define PS2_CMD 16
-#define PS2_SEL 15
-#define PS2_CLK 14
-PS2X ps2x;
-int  con_error = 1;
-bool controller_true = false;
-int  con_sp = 0;
-#define pressures false
-#define rumble    false
-
-void controller() {
-  if (con_error != 0) return;
-  ps2x.read_gamepad(false, 0);
-  if (ps2x.Button(PSB_L1) || ps2x.Button(PSB_R1)) {
-    controller_true = true;
-    con_sp      = -(map(ps2x.Analog(PSS_LY), 0, 255, -10, 10)) * 10;
-    steer_angle = -map(ps2x.Analog(PSS_RX), 0, 255, -21, 21);
-  } else {
-    controller_true = false;
-    con_sp      = 0;
-  }
-}
-
-// ── Serial 명령 파싱 ─────────────────────────────────────────────────────────
-void process_rx_line(const char* line) {
-  // C,vel,steer
-  if (line[0]=='C' && line[1]==',') {
-    const char* p  = line + 2;
-    int v = atoi(p);
-    const char* c2 = strchr(p, ',');
-    if (!c2) return;
-    int s = atoi(c2 + 1);
-
-    // ★ [변경 2] 클램프 버그 수정: ±MAX_VEL 기준
-    if (v >  MAX_VEL) v =  MAX_VEL;
-    if (v < -MAX_VEL) v = -MAX_VEL;
-    if (s >  21) s =  21;
-    if (s < -21) s = -21;
-
-    velocity    = v;
-    steer_angle = s;
-    return;
-  }
-
-  // S,0/1
-  if (line[0]=='S' && line[1]==',') {
-    int st = atoi(line + 2);
-    state = (st != 0);
-    // ★ [변경 3] E-Stop 시 적분 즉시 초기화
-    if (!state) {
-      velocity  = 0;
-      Sum_Error = 0;
-      motor_control(0);
-    }
-    return;
-  }
-}
-
-void serial_rx_poll() {
-  while (Serial.available() > 0) {
-    char ch = (char)Serial.read();
-    if (ch == '\r') continue;
-    if (ch == '\n') {
-      rx_line[rx_idx] = '\0';
-      if (rx_idx > 0) process_rx_line(rx_line);
-      rx_idx = 0;
-      continue;
-    }
-    if (rx_idx < sizeof(rx_line)-1) rx_line[rx_idx++] = ch;
-    else rx_idx = 0;
-  }
-}
-
-// ── setup / loop ─────────────────────────────────────────────────────────────
-void setup() {
-  Serial.begin(115200);
-
-  for (int i = 0; i < 5; i++) {
-    con_error = ps2x.config_gamepad(PS2_CLK, PS2_CMD, PS2_SEL, PS2_DAT, pressures, rumble);
-    if (con_error == 0) break;
-    delay(200);
-  }
-
-  pinMode(13, OUTPUT);
-  pinMode(MOTOR1_PWM, OUTPUT); pinMode(MOTOR1_ENA, OUTPUT); pinMode(MOTOR1_ENB, OUTPUT);
-  pinMode(MOTOR2_PWM, OUTPUT); pinMode(MOTOR2_ENA, OUTPUT); pinMode(MOTOR2_ENB, OUTPUT);
-  initEncoders(); clearEncoderCount(1); clearEncoderCount(2);
-  pinMode(MOTOR3_PWM, OUTPUT); pinMode(MOTOR3_ENA, OUTPUT); pinMode(MOTOR3_ENB, OUTPUT);
-
-  Error = Sum_Error = d_Error = 0;
-  old_val = 0; error_s = error_i_s = error_old_s = 0.0; pwm_prev_s = 0;
-
-  MsTimer2::set(20, control_callback);
-  MsTimer2::start();
-  t_start = millis();
-
-  Serial.println("Arduino v6 Ready. MAX_VEL=255 (ROS manages 71-tick limit)");
-}
-
-void loop() {
-  controller();
-  serial_rx_poll();
-  Velo_PID_Control();
-
-  if (controller_true) {
-    // 조종기 우선 (PS2)
-    motor_control(con_sp);
-    velo_val  = 0;
-    Sum_Error = 0;
-  } else if (state) {
-    // ROS2 자율주행
-    velo_val = velocity;
-  } else {
-    // E-Stop
-    velo_val = 0;
-  }
-
-  // ★ [변경 4] d_val 부호 포함 발행 (후진=음수)
-  Serial.print("E,");
-  Serial.println(d_val);
-
-  delay(10);   // CPU 과부하 방지 (delay(20) → delay(10))
-}

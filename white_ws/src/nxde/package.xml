@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>nxde</name>
+  <version>0.0.0</version>
+  <description>
+    white 자율주행 스택의 ★하드웨어 계층★ (Ubuntu 22.04 / ROS2 Humble 전용).
+    g.launch.py 하나로 kasa A/B 2보드 아두이노 + iAHRS IMU + u-blox GPS + USB 카메라의
+    연결·통신을 전담하며, 실패하거나 도중에 끊겨도 각자 재시도한다.
+    white 패키지의 자율주행 노드들과 /cmd_vel_raw · /control_state · /encoder 등
+    white 규약 토픽으로 직접 주고받는다. kasa_ws의 동명 패키지에서 통신 노드만
+    가져와 토픽 계약을 white에 맞춘 것으로, kasa_ws 쪽은 수정하지 않았다.
+  </description>
+  <maintainer email="test@test.com">windo</maintainer>
+  <license>TODO</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tf2_ros</depend>
+  <exec_depend>python3-serial</exec_depend>
+  <!-- g.launch.py 가 띄우는 외부 하드웨어 노드 -->
+  <exec_depend>nmea_navsat_driver</exec_depend>
+  <exec_depend>usb_cam</exec_depend>
+  <!-- usb_cam_ctrl 의 v4l2-ctl -->
+  <exec_depend>v4l-utils</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

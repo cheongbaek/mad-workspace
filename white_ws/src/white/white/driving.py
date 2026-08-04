@@ -197,10 +197,22 @@ driving.py ― GPS/IMU 기반 자율주행 제어 노드
 
 import rclpy
 from rclpy.node import Node
+from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Float64MultiArray, String, Int32, Bool
+from std_msgs.msg import Float64MultiArray, Float32MultiArray, String, Int32, Bool
 from sensor_msgs.msg import Imu   # [v6.7] 지연보상 상태예측용 요레이트
 import os, math, csv, time
+
+# [kasa 이식] 단위 환산의 단일 소유자. 엔코더/펄스/조향 상수는 여기서만 정의한다.
+from white import kasa_units as ku
+
+
+def _safe_float(v, default: float = 0.0) -> float:
+    """CSV 셀 → float. 컬럼 부재/빈칸/파싱실패 시 default (구버전 맵 호환용)."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
 
 
 # ── 속도 제한 사유 코드 (디버그/모니터 호환 유지) ───────────────────────────
@@ -209,7 +221,7 @@ SPD_REASON_CODE = {
     "CURVE":       1,   # 전방 곡률 비례 감속(선행)
     "BRAKE":       2,   # 제동거리 게이팅(코너 선행 감속)
     "CTE_RECOVERY":3,   # 횡오차 회복 감속
-    "STEER":       4,   # (예비)
+    "STEER":       4,   # [0714] 직선 실조향각 반응 감속(is_straight일 때 |prev_steer| 과대 시)
     "DR":          6,   # GPS 두절 DR 감속
     "RAMP":        7,   # 출발 점진가속
     "SPEED_PI":    8,   # 속도 PI 하강
@@ -217,7 +229,34 @@ SPD_REASON_CODE = {
     "DECEL_LIMIT": 10,
     "APPROACH":    11,  # 종점 접근 감속
     "OMEGA":       12,  # [v6.7] ω_n 결속: v ≤ Ω·LFD/√2 (곡률캡으로 LFD 짧아지면 속도도 함께)
+    "CUSP":        13,  # [후진] 전진↔후진 전환점 앞 near-stop 감속
+    "TL_HOLD":     14,  # [신호등] 게이트 정지 유지 중 — 진행·시계·적분 동결
 }
+
+# ════════════════════════════════════════════════════════════════════════════
+#  [2026-07-29] 속도 상한 비례 파생 상수
+#  max_speed_ms 를 바꿀 때 절대값 캡들을 손으로 같이 안 고치면 '상한 이상인 캡'이
+#  조용히 무효화된다(v_target 이 이미 상한 이하라 절대 안 걸림). 실제로 2.8→2.2 하향
+#  시 CTE 첫 캡(2.2)·STEER 첫 캡(2.3)·APPROACH 진입속도(2.6)가 전부 죽었다.
+#  → 튜닝 기준(max 2.8)에서의 '비율'로 저장하고, 상한이 바뀌면 자동 재산출한다.
+#  ※ GAIN_TABLE / LFD_TABLE 은 여기 해당 없음 — 절대속도 인덱스라 비례화하면
+#    ω_n≈1.0 설계가 깨진다(상한을 낮추면 상단 행이 미사용될 뿐, 매핑은 그대로 유효).
+# ════════════════════════════════════════════════════════════════════════════
+SPEED_TUNED_REF = 2.8              # 아래 비율들을 뽑은 기준 상한[m/s]
+CTE_RECOVER_CAP_RATIOS   = [(0.48, 2.2 / SPEED_TUNED_REF),
+                            (0.62, 1.7 / SPEED_TUNED_REF),
+                            (0.80, 1.2 / SPEED_TUNED_REF)]
+STEER_SPEED_CAP_RATIOS   = [(7.0,  2.3 / SPEED_TUNED_REF),
+                            (10.0, 1.8 / SPEED_TUNED_REF),
+                            (13.0, 1.3 / SPEED_TUNED_REF)]
+APPROACH_ENTRY_RATIO     = 2.6 / SPEED_TUNED_REF
+MIN_SPEED_RATIO          = 1.0 / SPEED_TUNED_REF
+# 하한 바닥값: 조향 실효권한(STEER_AUTHORITY_FULL_SPEED=0.5)보다 충분히 위여야 하고,
+#   출력이 부족한 차량이라 너무 낮추면 오르막에서 기어가듯 느려진다.
+# ★ [kasa 이식] 0.8 → 0.9 ★ 명령 분해능이 1펄스 = 0.884 m/s 라, 하한이 그보다 낮으면
+#   ms_to_pulse() 반올림에서 0(정지)으로 떨어져 주행 자체가 끊긴다.
+#   0.9 / 0.884 = 1.02 → 최소 1펄스가 보장된다.
+MIN_SPEED_FLOOR          = 0.9
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -233,12 +272,34 @@ GAIN_TABLE = [
     # 저속대(LFD 2.0~2.4)는 v6.5서 CTE 0.08~0.11로 이미 우수 → 게인 유지.
     # 고속대는 LFD를 짧게 했으므로 PP 게인이 자연히 커짐 → Kp 유지(과게인 방지),
     #   잔여 쏠림 제거 위해 Ki만 소폭↑. Kd는 lead가 주감쇠라 백업(코드서 ×0.20).
-    (1.0,     1.7,  0.12,  0.11),  # 2.0  : 급코너
-    (1.4,     1.9,  0.14,  0.14),  # 2.2
-    (1.8,     2.1,  0.16,  0.17),  # 2.4  : 코너 표준
-    (2.2,     2.3,  0.20,  0.21),  # 2.7  : 완만(구3.4) — Ki 0.18→0.20
-    (2.5,     2.5,  0.23,  0.25),  # 2.9  : 고속(구4.4) — Ki 0.20→0.23
-    (2.8,     2.6,  0.25,  0.30),  # 3.1  : 최고속(구5.5)— Ki 0.22→0.25(쏠림 타이트)
+    # ── [2026-07-29] 운용구간(0.8~1.8) 세분화 ────────────────────────────
+    #   max_speed_ms 1.8 / min_speed_ms 0.8 이라 실제로는 이 구간만 쓰인다.
+    #   · 0.8 행 신설: 종전엔 표가 1.0 부터라 0.8~1.0 이 첫 행으로 '클램프'돼
+    #     스케줄이 끊겨 있었다(코너·종점접근·출발램프에서 이 구간을 지난다).
+    #     아래 방향 추세 연장(Kp 기울기 0.5/[m/s])으로 채웠다. Ki/Kp/Kd 는
+    #     LFD_TABLE 클램프(min_lfd)와 무관하게 표값대로 정상 조회됨을 로스백으로
+    #     확인함(16_07_06/16_12_27, i_term/cte_integral 역산 0.110 일치).
+    #   · 1.2 / 1.6 행: 기존 선형보간과 '동일한 값'을 그대로 명시한 것이라
+    #     거동 변화가 전혀 없다. 앞으로 그 구간만 따로 튜닝할 수 있게 하는 목적.
+    #   · 1.0 / 1.4 / 1.8 은 실측 검증값(CTE 직진 0.097 / 코너 0.105)이라 불변.
+    # ── [2026-07-30] 2.2 초과 행 삭제 ──────────────────────────────────────
+    #   차량 제원 최고속도 8km/h = 2.222 m/s → 2.5/2.8 행은 물리적으로 도달 불가.
+    #   LFD_TABLE 과 브레이크포인트를 일치시켜야 두 표가 함께 설계된 의미가 유지된다.
+    #   게인값 자체는 건드리지 않았다(LFD 만 바꿔 원인 추적을 단순하게 유지).
+    #   [2026-07-30] LFD 상향을 실측(|CTE| +82~94%)으로 원복함(LFD_TABLE 주석 참고) —
+    #     대응 LFD 주석도 원래 값으로 되돌렸다. 게인은 애초에 안 건드려서 변화 없음.
+    (0.8,     1.60, 0.110, 0.095), # LFD 2.3(=min_lfd) : 저속(코너·접근·출발)
+    (1.0,     1.7,  0.12,  0.11),  # LFD 2.3  : 급코너
+    (1.2,     1.80, 0.130, 0.125), # LFD 2.4
+    (1.4,     1.9,  0.14,  0.14),  # LFD 2.5
+    (1.6,     2.00, 0.150, 0.155), # LFD 2.65
+    (1.8,     2.1,  0.16,  0.17),  # LFD 2.8  : 현 운용상한
+    (2.2,     2.3,  0.20,  0.21),  # LFD 3.2  : 도달 불가 구간(제원 2.222 초과)
+    # [0713] Ki 0.20/0.23/0.25→0.15/0.17/0.18 축소를 실주행으로 검증했으나 원복.
+    # LEAD=1.2 기준으로 비교 시 steady-state std 0.113(Ki원본) → 0.143~0.144(Ki축소) 로
+    # 오히려 악화, 평균편향도 -0.05→-0.09로 커짐(우려했던 쏠림 재발 신호). LEAD=1.2 +
+    # Ki원본 조합이 오늘 실험한 것 중 최적점이었음 — 추가 튜닝(LEAD 1.4, Ki 축소) 둘 다
+    # 후퇴였으므로 여기서 멈추고 이 조합으로 원복.
 ]
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -260,22 +321,89 @@ LFD_TABLE = [
     #   곡률캡 min(표, √1.5R)은 유지 → 급코너는 캡이 지배(코너 성능 불변), 완만코너·
     #   직선만 LFD가 길어져 감쇠 회복. 튜닝: 고속서 아직 왕복이면 고속행을 더 키우고
     #   (ω_n↓), 코너진입이 굼뜨면 곡률캡K(1.5)를 살짝 올린다.
+    # ── [2026-07-29] LFD 상향 실험 → 원복함. 재시도 전 아래 실측을 반드시 볼 것 ──
+    #   시도: 저속 순항(1.2~1.5m/s)에서 조향이 0 주위로 std 3.01° 진동(IMU 요레이트
+    #     주피크 0.116Hz, 조향→요레이트 r=+0.616)했고, 실측 진동 0.73rad/s 가
+    #     ω_n=v√2/LFD=1.24·1.414/2.42=0.72 와 일치 → PP 고유진동수 한계진동으로 판단.
+    #     표를 2.8/3.1/3.3/3.4/3.7/4.0 으로 올려 ω_n 0.72→0.59 로 낮춰봤다.
+    #   결과(17_06_28 구 vs 18_16_34 신, 같은 경로 317WP):
+    #     ✅ 조향반전 44.6 → 20.9 회/분 (-53%),  속도달성 87 → 93%
+    #     ❌ |CTE| 평균 0.106 → 0.161 (+52%), 최대 0.230 → 0.479 (+108%)
+    #     ❌ 코너 |CTE| 0.098 → 0.202 (+106%),  cte_integral 최대 0.598 → 1.413
+    #   실패 원인: "급코너는 곡률캡 √1.5R 이 보호한다"는 전제가 이 경로에선 틀렸다.
+    #     코너가 완만해 곡률캡이 15.8m 로 계산돼 **한 번도 안 걸렸고**, 표값이 그대로
+    #     적용돼 코너 안쪽을 잘랐다. [0713] 주석의 cte_integral 누적 확대도 재현됨.
+    #   → 추종 정확도 우선으로 원복(사용자 결정).
+    #   ※ [2026-07-30 정정] 여기 원래 "재시도하려면 곡률캡 K 를 먼저 키워 캡이 실제로
+    #     걸리게 만든 뒤 표를 올려라" 고 적혀 있었으나 **틀렸다**. cap=√(K·R) 이므로
+    #     K↑ 는 캡을 크게(=느슨하게) 만들어 덜 걸리고, 코너컷 오차상한 K/8 도 함께
+    #     커진다. 캡을 더 걸리게 하려면 K 를 내려야 한다. 아래 [2026-07-30] 항목 참조.
+    # ── [2026-07-29] 운용구간(0.8~1.8) 세분화 — GAIN_TABLE 과 브레이크포인트 일치 ──
+    #   · 1.2 / 1.6 은 기존 보간과 같은 값 → 거동 불변, 튜닝 해상도만 확보.
+    #   · 1.0 / 1.4 / 1.8 은 실측 검증값이라 불변.
+    # ── [2026-07-30] 0.8 행 2.2→2.3 정정 ──────────────────────────────────
+    #   self.min_lfd=2.3(v6.4, 오실레이션 영역 탈출 실측값)이 이 표보다 늦게 읽혀
+    #   dynamic_lfd 하한을 무조건 2.3으로 밀어 올린다. 0.8행을 2.2로 넣어도 실제로는
+    #   한 번도 안 나가고 조용히 2.3으로 클램프됐음(로스백 16_07_06/16_12_27 확인,
+    #   두 곳 모두 0.8~1.0 구간에서 dynamic_lfd 실측 2.300 고정, 표값 2.2는 미도달).
+    #   표를 실제 하한과 일치시킨다 — min_lfd 를 낮추는 건 v6.4가 실측으로 잡은 값이라
+    #   보류. 결과적으로 0.8~1.0 구간은 LFD 2.3 그대로(거동 변화 없음).
+    # ── [2026-07-30] LFD 상향 재시도(위상여유 설계) → 원복함 ★★★ 재시도 전 필독 ──
+    #   시도 근거는 탄탄했다: 직선순항 조향 성분분해 결과 진동의 91%가 PP 기하(PID 10%뿐)
+    #     였고, 조향명령·요레이트·CTE 주피크가 0.188Hz 로 일치해 닫힌루프 리밋사이클임을
+    #     확인. 지연 τ 를 세 방법(상호상관 1.20s/0.70s, 리밋사이클 자기일관 역산 0.93s)
+    #     으로 교차검증해 τ=0.93s 채택, PP 위상여유(PM) 공식으로 v=1.8 LFD 2.8→3.9
+    #     (ω_n 0.91→0.65, PM -2.9°→+10.4°) 설계. 이론상 -180° 를 벗어나는 안정화였다.
+    #   그런데 실측(18_09_35, 18_15_03 — 같은 직선, 정착후 구간만 비교)에서:
+    #     ✅ 조향 std  3.25°→ 3.09°/2.56° (-5%~-21%, 예측 방향은 맞음)
+    #     △ 부호반전  30.0회/분 → 25.0(-17%) / 42.0(+40%)  (로스백 간 불일치, 통계불안정)
+    #     ❌ |CTE| 평균 0.090 → 0.175 / 0.164  (+82~94%, 7/29 실패(+52%) 보다 더 나쁨)
+    #     cte_integral 범위는 오히려 좁아짐(와인드업은 아님) — 그런데도 CTE 자체가 늘었다.
+    #   실패 원인(추정, 미확증): τ=0.93s 가 과소평가였을 가능성. 이번 실측 지연이
+    #     0.85s/1.25s 로 로스백마다 갈렸는데 1.25s 로 계산하면 PM 이 설계보다 나빠진다.
+    #     위상여유 이론 자체가 틀린 게 아니라 τ 입력값 추정이 부정확했던 것으로 보인다.
+    #   → 사용자 결정으로 표값 원복(1.2~1.8 행을 상향 이전 값으로). 재시도하려면
+    #     A,angle 같은 조향각 실측 피드백을 아두이노에 추가해 τ 를 추정이 아니라
+    #     직접 측정부터 하고 시작할 것 — 지연 추정 부정확이 이번 실패의 유력 원인이다.
+    #   ── [2026-07-30] 2.2 초과 행 삭제(이 결정은 유효, 원복 대상 아님) ───────────
+    #     차량 제원 최고속도가 8km/h = 2.222 m/s 라 2.5/2.8 행은 물리적으로 도달 불가.
+    #     표의 마지막 행이 2.2 이므로 lookup_lfd 는 v≥2.2 에서 그 값을 반환한다.
+    #     GAIN_TABLE 도 같은 구간까지만 남겨 브레이크포인트를 일치시켰다.
+    (0.8,     2.3),   # ω_n 0.49  min_lfd 클램프와 일치(저속·코너·종점접근·출발램프)
     (1.0,     2.3),   # ω_n 0.61 (급코너는 곡률캡√1.5R≈2.0~2.1이 지배)
+    (1.2,     2.4),   # ω_n 0.71
     (1.4,     2.5),   # ω_n 0.79
-    (1.8,     2.8),   # ω_n 0.91 (2.4→2.8)
-    (2.2,     3.2),   # ω_n 0.97 (2.7→3.2)
-    (2.5,     3.6),   # ω_n 0.98 (2.9→3.6)
-    (2.8,     4.0),   # ω_n 0.99 (3.1→4.0) 고속 직선 발산 해소 핵심
+    (1.6,     2.65),  # ω_n 0.85
+    (1.8,     2.8),   # ω_n 0.91  현 운용상한 — 위상여유 재시도는 위 실패기록 참고
+    (2.2,     3.2),   # ω_n 0.97  도달 불가 구간(제원 2.222 초과)
+    # [0713] 4.4로 올려서 재검증했으나 실주행 로스백에서 오히려 악화 확인
+    #   (평균swing 14.8°→19.2°, 최대 17.4°→22.7°, half-cycle 3→5회).
+    #   ※ 단 그 시험은 v=2.8 행(ω_n 0.90)에서 한 것이라 이번 v=1.8·ω_n 0.65 와는
+    #     동작점이 다르다. 그래도 max_lfd 4.0 은 그 실측을 존중해 올리지 않았다.
+    #   원인: LFD↑ → 기하 P응답 약화 → half-cycle 길어짐 → cte_integral 누적 확대
+    #   → 부호반전 시 ×0.35 잔류값도 커짐 → 반대쪽 오버슛 확대(PID 적분 상호작용,
+    #   ω_n 공식은 이 결합을 반영 못함). 4.0으로 원복. 다음 시도는 Ki(현재 0.25)
+    #   축소 쪽이 유력 — 무작정 재변경하지 말 것.
 ]
 
 
 class DrivingNode(Node):
 
     # ── 엔코더/속도 환산 상수 ──────────────────────────────────────────────
-    WHEEL_CIRCUMFERENCE   = 0.27 * math.pi   # 0.8482 m (바퀴 둘레)
-    TICKS_PER_REV         = 300.0
-    DT_ENC                = 0.01             # 아두이노 속도 PID 주기 10ms
-    ENCODER_SPEED_LPF_TAU = 0.05
+    # ★ [kasa 이식] 값은 white/kasa_units.py 가 소유한다 ★ 여기서 리터럴을 다시 쓰면
+    #   gps_imu / sensor_monitor 와 어긋난다(예전엔 세 곳이 각자 하드코딩했다).
+    #     이전(white 차량) : 0.8482 m 둘레 / 300틱 1회전 / 10ms 창 → 1틱 = 0.283 m/s
+    #     현재(kasa 차량)  : 1.6971 m 둘레 / 192카운트 1회전(좌+우 합) / 20ms 창
+    #                        → 1카운트 = 0.442 m/s
+    WHEEL_CIRCUMFERENCE   = ku.WHEEL_CIRCUMFERENCE_M      # 1.697147 m (175/60R13)
+    TICKS_PER_REV         = float(ku.ENCODER_COUNTS_PER_REV)   # 192 = 96 × 2 (좌+우 합)
+    DT_ENC                = ku.PULSE_WINDOW_S             # 0.020 s (A보드 인휠 제어주기)
+    # ★ [kasa 이식] 0.05 → 0.15 ★ /encoder 도착 주기가 바뀌어 재조정했다.
+    #   white 차량은 아두이노가 E 프레임을 훨씬 촘촘히 보내 alpha 가 작았지만, kasa 는
+    #   50ms(20Hz)라 tau=0.05 면 alpha = 0.05/(0.05+0.05) = 0.5 로 사실상 필터가 없다.
+    #   게다가 양자화 눈금이 0.442 m/s 로 커져(이전 0.283) 원신호가 더 거칠다.
+    #   되돌리기: 0.05 로 두면 이전과 같은 계수. 실차 로스백으로 재조정할 대상이다.
+    ENCODER_SPEED_LPF_TAU = 0.15
 
     # ── 루프 경로 자동 절단 ────────────────────────────────────────────────
     LOOP_DETECT_THRESHOLD = 3.0
@@ -290,29 +418,167 @@ class DrivingNode(Node):
 
     def __init__(self):
         super().__init__("driving_node")
-        self.data_dir = os.path.expanduser("~/white_ws/gps_data")
+        # mapping.py가 저장하는 폴더와 동일해야 한다(주석 참조).
+        self.data_dir = os.path.expanduser("~/white_ws/white_ws/gps_data")
 
         # ── 차량/속도 파라미터 ────────────────────────────────────────────
-        self.vehicle_length = 0.73                 # 휠베이스 [m]
-        self.STEER_MAX_DEG  = 20.0                 # ROS측 조향 클램프(아두이노는 21°)
+        # ★ [kasa 이식] 차량 제원 교체 ★ white 차량(휠베이스 0.73m / 조향 ±21°)과 체급이
+        #   다르다. 축거는 kasa_ws master.py 의 디퍼렌셜 계산에 쓰인 실측값(1250mm)이다.
+        #   순수추종 조향각이 휠베이스에 정비례하므로 이 값이 틀리면 전 구간이 어긋난다.
+        self.vehicle_length = ku.WHEELBASE_M       # 휠베이스 1.25 [m] (실측 축거 1250mm)
+        self.STEER_MAX_DEG  = float(ku.STEER_MAX_DEG)   # ROS측 조향 클램프 (B보드도 ±40°)
         self.STEER_AUTHORITY_FULL_SPEED = 0.5      # [v6.6] 이 속도[m/s]↑서 조향 full 권한(저속 램프)
-        # 물리 최소 회전반경 = L/tan(steer_max) = 0.73/tan(20°) ≈ 2.01m
-        self.max_speed_ms   = 2.8                  # PWM205 상한 = 실측 약 2.8m/s
-        self.min_speed_ms   = 1.0                  # 주행 중 최저 속도
+        # 물리 최소 회전반경 = L/tan(steer_max)
+        #   [kasa] 1.25/tan(40°) ≈ 1.49m   (이전 white 차량: 0.73/tan(20°) ≈ 2.01m)
+        # [2026-07-29 실측] 기존 2.8 은 'PWM205=2.8m/s' 무부하 실측 근거였으나, 실주행
+        #   로스백(15_51_15) 분석 결과 실차 달성속도는 평지 풀스로틀 1.79 / 오르막 1.44 m/s
+        #   뿐이었다(달성률 59%). 2.8 을 명령하면 아두이노 속도PID 가 전 구간 PWM 포화
+        #   상태로 고정돼 '제어'가 사라지고, 속도는 지형(피치)이 결정한다 — 실측에서
+        #   속도와 피치의 진동 스펙트럼이 동일(3.7s/8.7s)했고 상관 r=-0.70 이었다.
+        #   → 도달 가능한 값으로 낮춰야 PID 에 여유(headroom)가 생겨 속도가 일정해진다.
+        #   파라미터화: 현장에서 rebuild 없이 튜닝/AB 비교 가능
+        #     ros2 param set /driving_node max_speed_ms 1.5
+        #   [2026-07-29 4차] 아두이노 FIX-1(d_val 절삭 수정) 적용 완료 → 1.5 → 1.8.
+        #   차가 빨라진 게 아니라 '속도 보고가 정확해진' 것이다. 절삭 버그로 20% 낮게
+        #   읽던 엔코더가 정상화되면서, 같은 물리속도가 약 18% 높은 숫자로 보고된다.
+        #     · 제원(헤네스 브룬 T870): Dual 24V DC 240W, 최고 8 km/h(2.22 m/s), 탑승 35kg
+        #     · PWM 205 = 리튬 완충 29.4V × 0.804 = 23.6V → 모터 정격 24V 보호값(유지)
+        #     · PWM 205 포화 평지 능력: 보고 1.79 → 패치 후 약 2.11 m/s
+        #   → 1.8 = 2.11 의 85%(헤드룸 15%). 1.5 를 그대로 두면 물리적으로 15% 느려진다.
+        #
+        #   ⚠️ 2.11 은 GPS 역산 추정치다. 첫 주행에서 포화 시 실제 보고 속도를 확인하고
+        #      그 85% 로 확정할 것.  ros2 param set /driving_node max_speed_ms <값>
+        #   ※ LFD_TABLE / GAIN_TABLE 은 손대지 않는다. 두 표 모두 '진짜 속도'의 함수로
+        #     설계됐는데 그동안 낮게 읽힌 값으로 조회하느라 잘못된 행을 봤다. 보고가
+        #     정확해지면 올바른 행을 조회하게 되어 자동 교정된다(실제 ω_n 이 오히려
+        #     0.85→0.81 로 안정 쪽으로 이동). 표를 또 바꾸면 이중 보정이 된다.
+        #
+        # ══════════════════════════════════════════════════════════════════════
+        #  ★★ [kasa 이식] 위 문단 전체는 white 차량(헤네스 브룬 T870, 최고 8km/h) 기록이다 ★★
+        #  kasa 차량은 인휠 2개(QSWP72V5000W)로 차량 상한이 47.7 km/h(13.26 m/s)다.
+        #  그래서 '도달 가능한 값으로 낮춘다'는 위 논리는 더 이상 병목이 아니고,
+        #  대신 ★명령 분해능★이 병목이 된다 — A보드 목표가 정수 펄스라 1펄스 = 0.884 m/s.
+        #
+        #    max_speed_ms   사용 가능한 펄스 단계        속도
+        #      1.77          1~2  (2단계)              6.4 km/h  ← 이전 규모
+        #      2.65          1~3  (3단계)              9.5 km/h  ← 현재 기본값
+        #      4.42          1~5  (5단계)             15.9 km/h
+        #      8.84          1~10 (10단계)            31.8 km/h
+        #
+        #  기본값을 2.65 로 둔 이유 :
+        #    · GAIN_TABLE / LFD_TABLE 의 최상단 행이 2.2 m/s 다. 2.65 는 그 20% 위라
+        #      상단 구간만 최상단 행으로 클램프되고 스케줄 대부분이 살아 있다.
+        #    · ★4.42 이상으로 올릴 때는 두 표에 2.2 초과 행을 실차 로스백으로 채워야 한다★
+        #      안 채우면 고속 구간 전체가 2.2 행의 게인/LFD 를 쓰게 되어(ω_n 설계가 깨짐)
+        #      코너에서 언더스티어가 누적된다.
+        #    · 휠베이스가 0.73 → 1.25m 로 커져 같은 조향각의 회전반경이 1.7배가 되었다.
+        #      GAIN_TABLE 은 그 전제로 튜닝된 게 아니므로 어차피 실차 재튜닝이 필요하다.
+        #  현장 튜닝 : ros2 param set /driving_node max_speed_ms 4.42
+        # ══════════════════════════════════════════════════════════════════════
+        self.declare_parameter("max_speed_ms", 2.65)   # 상한[m/s] — 3펄스 ≈ 9.5km/h
+        self.max_speed_ms   = max(0.3, float(self.get_parameter("max_speed_ms").value))
+        # 차량 물리 상한(펄스 15)을 넘는 값은 A보드에서 잘리므로 여기서 미리 막는다
+        self.max_speed_ms   = min(self.max_speed_ms, ku.MAX_SPEED_MS_LIMIT)
         self.safe_stop_speed = 0.08                # 정지로 간주하는 미세속도
+        # min_speed_ms / 각종 속도캡은 상한에 비례해 _apply_speed_scaling() 에서 산출한다.
+        #   (아래 declare_parameter 들보다 먼저 호출하면 안 되는 값은 없다)
+        self._apply_speed_scaling()
+
+        # ── [후진 저속 정밀주행] direction=-1 구간 전용 속도 규약 ──────────────
+        #   목적: 후진은 주차 등 정밀기동이라 1m/s 미만 저속으로. 저속일수록 PP 추종
+        #   오차가 작아 정확도가 오른다. 전진(min_speed_ms=1.0)엔 영향 없음.
+        self.declare_parameter("rev_max_speed", 0.6)   # 후진 상한[m/s] (<1.0)
+        self.declare_parameter("rev_min_speed", 0.2)   # 후진 하한[m/s] (전진 floor 대체)
+        self.REV_MAX_SPEED = float(self.get_parameter("rev_max_speed").value)
+        self.REV_MIN_SPEED = float(self.get_parameter("rev_min_speed").value)
+        # ── [전환점(cusp) 감속] 전진↔후진 부호반전 지점 앞에서 near-stop 까지 감속 ──
+        #   목적: signed_spd=v*cur_dir 는 방향이 바뀌면 한 틱에 +→- 로 뒤집혀(급브레이크
+        #   이상) 드라이브트레인에 무리. 전환점 앞 CUSP_SLOWDOWN_DIST[m] 부터 선형 감속해
+        #   전환점에서 CUSP_MIN_SPEED 로 거의 멈춘 뒤 반대방향으로 재가속한다.
+        self.CUSP_SLOWDOWN_DIST = 1.2   # 이 거리[m] 안부터 감속 시작
+        self.CUSP_ENTRY_SPEED   = 0.8   # 감속 시작 상한[m/s]
+        self.CUSP_MIN_SPEED     = 0.15  # 전환점 도달 시 목표[m/s] (near-stop)
+        self.CUSP_SEARCH_WP     = 60    # 전방 cusp 탐색 WP 창
 
         # 출발 점진 가속
         self.RAMP_UP_DURATION = 3.0
         self.ramp_up_active   = False
         self.drive_start_time = 0.0
-        self.dr_speed_factor  = 0.6                # GPS 두절(DR) 시 감속 계수
+        # GPS 두절(DR) 시 감속 계수 — 카메라 융합 시 DR 진입 감속을 튜닝할 수 있게 파라미터화.
+        #   launch 에서 dr_speed_factor:=0.5 처럼 낮추면 DR 진입 시 더 크게 감속.
+        self.declare_parameter("dr_speed_factor", 0.6)
+        self.dr_speed_factor  = float(self.get_parameter("dr_speed_factor").value)
+
+        # ══════════════════════════════════════════════════════════════════
+        # [카메라 융합 v2] GPS 단절 중 차선 기반 횡위치 보정
+        # ══════════════════════════════════════════════════════════════════
+        # 목표: "GPS가 끊겨도 매핑 때와 같은 선을 유지한다".
+        #
+        # 원리: 매핑 때 같은 지점에서 읽었던 lane_cte(맵 컬럼)와 지금 카메라가 읽는 cte 의
+        #   차이가 곧 '매핑 선 대비 횡오차'다.
+        #        횡오차 = cte_now − lane_cte[wp_idx]
+        #   매핑·주행이 같은 카메라를 쓰므로 카메라 계통편향(cam_yaw_offset·px2m 캘리브
+        #   오차)이 이 뺄셈에서 상쇄된다 → 차선중심의 절대좌표를 몰라도 되고, 캘리브를
+        #   먼저 잡을 필요도 없다. 결과가 0이면 '매핑 때와 정확히 같은 선 위'다.
+        #
+        #   측정된 횡오차를 ctrl_lat/lon(제어 전용 예측자세)에 주입하면 WP탐색·CTE·PP
+        #   전 채널이 자동으로 보정된 자세를 본다. gps_imu 는 건드리지 않는다
+        #   ("지도 없이 동작" 철학 유지 — /lane_heading_ref 가 반대로 갔다가 접힌 길).
+        #   위치추정 자체는 무보정이라 GPS 복귀 시 gps_imu 의 DR→GPS 블렌딩이 그대로 먹고,
+        #   /ego_state·로스백에는 원시 DR 이 남아 사후분석이 오염되지 않는다.
+        #
+        # ⚠️ CAM_LAT_ENABLE 기본 False 유지 — 부호는 확정됐으나 아래 3건이 미해결이다.
+        #   [1차 실측: rosbag2_2026_07_15-22_24_21, 27초 주행 / 맵 커버리지 87%]
+        #   ✅ 부호 확정 — 주행중(>0.8m/s) n=72 에서 cte(3) vs cam_lat_err(27):
+        #        r=+0.809, 그리고 lag=0 에서 최대 → 예측 위상차는 문제가 아니었다.
+        #   ✅ 편향상쇄 가설 검증됨 — 회귀 offset=-0.047m. 매핑·주행이 같은 카메라를 써서
+        #        계통편향이 실제로 뺄셈에서 상쇄된다(이 접근 전체의 전제였고, 통과했다).
+        #   ❌ DR 0회 — dr_active 0/540. 이 기능의 존재 이유인 GPS단절을 한 번도 못 봤다.
+        #        효과 미검증. DR 드리프트가 초당 몇 cm 인지 모르면 켤 근거가 없다.
+        #   ❌ 카메라 노이즈가 유색(colored) — 차가 완전정지 중인데도 cte 가 std=0.090m,
+        #        p2p=0.337m 로 배회한다(GPS cte 는 std=0.020m → 진짜로 안 움직였다는 증거).
+        #        자기상관 0.4s 에서 +0.631 → 상관시간 ~1s. 그런데 CAM_LAT_GAIN=0.05 의
+        #        시정수가 정확히 1s 라 저역통과가 이 노이즈를 못 지운다 → 지금 켜면 차가
+        #        ±0.17m 배회를 그대로 따라간다. ★게인을 낮춰도 상관시간이 같으면 소용없다.
+        #   ❌ slope=0.70 (기대 1.0) 원인 미상 — 차선폭이 3.21±0.26m 로 정확히 나오므로
+        #        px2m 단순 스케일 오차가 아니다(30% 틀렸으면 폭도 30% 틀려야 한다).
+        #        theta 도 같은 방향으로 크기 미달(slope -0.37) → 계통적인 원인이 따로 있다.
+        #        IPM src_pts(원근 변환) 의심되나 미확인.
+        #   [2차 실측: rosbag2_2026_07_16-21_33_05, 속도게이트 빌드 + 새 맵(21:27)]
+        #   ✅ slope 미스터리 해소 — n=274, slope=+0.954(≈1), offset=+0.070m, R²=0.781.
+        #        1차의 0.70 은 gps_imu 정지폭주 버그로 오염된 헤딩 때문이었다.
+        #   ⚠️ offset 이 주행마다 다름(1차 -0.047 → 2차 +0.070) — 정지 노이즈 테스트에서
+        #        확인된 카메라 '재고정 다중안정'(±8.5cm 레벨시프트, conf 로 검출 불가)과
+        #        같은 크기. 즉 이 방식의 절대 정확도 바닥 ≈ ±10cm 로 보는 게 맞다.
+        #   ❌ DR 여전히 0회 — 안테나 가림으로는 RTK 가 안 끊겼다(fix 최대 간격 0.21s).
+        #        nmea 드라이버 kill -STOP/-CONT 방식으로 재시도할 것.
+        #   ★켜기 전 조건(갱신): DR 드리프트 실측만 남음. 드리프트가 카메라 정확도 바닥
+        #     (±10cm)보다 충분히 크면 켠다.
+        #
+        # [v6.8] cam_lat_enable 파라미터로 승격(기본 False 유지 — 위 ★조건 그대로).
+        #   launch 인자나 `ros2 param set /driving_node cam_lat_enable true` 로 켤 수 있다.
+        #   ⚠ prompt.py 메뉴에는 일부러 노출하지 않았다 — 위 미해결 3건이 남은 기능을
+        #     메뉴에서 무심코 켤 수 있게 만들면 ★조건 게이트를 우회하는 셈이 된다.
+        self.declare_parameter("cam_lat_enable", False)
+        self.CAM_LAT_ENABLE     = bool(self.get_parameter("cam_lat_enable").value)
+        self.CAM_LAT_DR_ONLY    = True   # True=DR(GPS단절)에서만 개입 → RTK 정상주행 무손상
+        self.CAM_LAT_SIGN       = +1.0   # [2026-07-15 실측확정] r=+0.809 offset=-0.047m n=72
+        self.CAM_LAT_GAIN       = 0.05   # 잔차의 5%씩 수렴 (gps_imu CAM_HEAD_GAIN=0.04 와 동급 저게인)
+        self.CAM_LAT_MAX_STEP_M = 0.05   # 1틱 최대 보정 이동량 [m] (급변 방지)
+        self.CAM_LAT_MAX_BIAS_M = 1.00   # 누적 보정 상한 [m] (폭주 방지)
+        self.CAM_LAT_MAX_ERR_M  = 1.00   # 측정 횡오차가 이보다 크면 오검출 의심 → 무시
+        self.CAM_LAT_CONF_MIN   = 0.50   # 양쪽차선만 신뢰(단독차선 F_SINGLE 은 편향상쇄가 깨짐)
+        self.CAM_LAT_MAX_AGE    = 0.40   # [s] /lane_metrics 신선도 (gps_imu.CAM_HEAD_MAX_AGE 와 동일)
+        self.CAM_LAT_MAX_GYRO   = math.radians(10.0)  # 직진에서만(코너 확장은 실측 후)
+        self.CAM_LAT_DECAY      = 0.98   # 차선 두절 시 bias 를 서서히 0으로(복귀 스텝 방지)
+        # ══════════════════════════════════════════════════════════════════
 
         # ── LFD (전방주시거리) — 속도 테이블(LFD_TABLE) + 곡률캡 ─────────────
         # [v6.1] 연속식(2.22v−0.22, 최대6m)이 코너를 잘라(코너컷 CTE=LFD²/8R) 폐지.
         #   실제 LFD = min( 속도표 LFD, 곡률캡 ),  곡률캡 = √(LFD_CURVE_CAP_K·R_ahead)
         #   R_ahead = L/tan(near_demand). 코너가 급할수록 LFD를 직접 짧게 → 컷 차단.
         self.min_lfd   = 2.3                       # [v6.4] 2.0→2.3 (진동유발 영역 탈출)
-        self.max_lfd   = 4.0                       # [v6.6.2] 3.3→4.0 (고속 직선서 신규 LFD 4.0 적용 허용; 곡률캡이 코너를 계속 보호)
+        self.max_lfd   = 4.0                       # [0713] 4.4로 시도했으나 실주행에서 오실레이션 악화 확인 → 4.0 원복(LFD_TABLE 주석 참고)
         self.LFD_CURVE_CAP_K = 1.5                 # [v6.6] 1.6→1.5 (코너 살짝 더 타이트) — v6.6.2 유지(코너 성능 불변)
         self._lfd_lpf  = self.min_lfd
         self.LFD_LPF_ALPHA = 0.40                  # LFD 급변 완화(시상수 ≈95ms@20Hz)
@@ -337,9 +603,11 @@ class DrivingNode(Node):
         self.CURVE_WINDOW_PEAK_M     = 1.2
         # [v6.7.3] 급코너 피크를 '속도'에 반영하는 비율(곡률캡=LFD엔 항상 완전 반영).
         #   곡률캡이 코너컷을 이미 막으므로 속도는 부분만 낮춰 순항속도 보존.
-        #   0.35: 급코너 피크 5° 초과분의 35%만 감속에 반영(정상코너 속도 거의 불변,
-        #   급코너만 소폭 추가 감속). 급코너서 아직 밀리면 0.5로 ↑, 과잉감속이면 0.2로 ↓.
-        self.PEAK_SPEED_BLEND        = 0.35
+        #   급코너서 아직 밀리면 0.6으로 ↑, 과잉감속이면 0.35로 ↓.
+        # [0713] 0.35→0.50: 0704 로스백 4건 재시뮬 — 급필렛(R≈3m)서 LFD캡은 반영되나
+        #   속도 미반영분이 CTE 0.6~1.3m 피크 주범. blend 인상 비용은 직선 -2~3cm/s(≈0),
+        #   급피크 틱에서만 약 -15cm/s. 잔떨림 대역폭 불변(평활신호에 상수곱).
+        self.PEAK_SPEED_BLEND        = 0.50
         self.BRAKE_GATE_DECEL        = 2.0         # 제동거리 가정 감속도[m/s²] (조기 감속 위해 보수적)
         self.BRAKE_GATE_MARGIN       = 1.5         # 코너 1.5m 전엔 목표속도 도달(조기)
 
@@ -364,8 +632,17 @@ class DrivingNode(Node):
         # [v6.1] LFD를 짧게 만들어 CTE가 애초에 안 커지므로, 회복캡은 진짜 큰 오차에서만.
         # [v6.4] 0.30→0.38: 0.3m 잔여 쏠림이 CTErec를 발동시켜 불필요 감속하던 것 방지(속도↑).
         self.CTE_RECOVER_START = 0.38              # 이 이상 CTE면 속도 캡 시작
-        #   <0.38: 제한없음 / 0.48→2.2 / 0.62→1.7 / 0.80↑→1.2
-        self.CTE_RECOVER_CAPS = [(0.48, 2.2), (0.62, 1.7), (0.80, 1.2)]
+        # 실제 캡값(CTE_RECOVER_CAPS)은 _apply_speed_scaling() 이 상한에서 비례 산출한다.
+        #   원본(@max 2.8): 0.48→2.2 / 0.62→1.7 / 0.80↑→1.2 — 비율은 SPEED_CAP_RATIOS 참조.
+
+        # [0714] 직선 실조향각 반응 감속(SPD_REASON_CODE "STEER" 예비자리 채움).
+        #   경로곡률(near/far_demand)은 계속 직선인데 실제 조향각(prev_steer)이 크게
+        #   흔들리는 건 오실레이션 신호 — is_straight일 때만 캡을 걸어 코너 진입(far_peak
+        #   선행감지로 is_straight가 먼저 꺼짐)과 겹치지 않게 함. 코너 진입 감속(CURVE/
+        #   BRAKE)과는 별개 채널이라 이중감속 없음.
+        self.STEER_SPEED_START_DEG = 5.0            # 이 이상 |prev_steer|(직선 중)면 속도 캡 시작
+        # 실제 캡값(STEER_SPEED_CAPS)은 _apply_speed_scaling() 이 상한에서 비례 산출한다.
+        #   원본(@max 2.8): 7°→2.3 / 10°→1.8 / 13°→1.3
 
         # ── [v6.7] ① 루프 지연 보상: 상태 전방 예측 ──────────────────────
         # 로스백 실측(0702 주행): 조향 명령→실제 요레이트 지연 0.45s(상관 0.971),
@@ -375,8 +652,11 @@ class DrivingNode(Node):
         # '그 자세'로 WP탐색·CTE·PP를 계산 → 잃어버린 위상을 조향 전 채널에서 복원.
         # 폐루프 시뮬 검증: 과대예측(0.65s)은 역효과·불안정, 0.35~0.50이 안전역
         # → 기본 0.40s(보수). 왕복이 남으면 0.50까지 ↑, 예민해지면 0.30으로 ↓.
-        self.PREDICT_HORIZON_S   = 0.45    # [s] 0=예측 끔(비권장) [v6.7.1] 재실측 조향지연
-                                           #   0.55s(0703) 반영 0.40→0.45. 상한 0.50 엄수.
+        # [0714] 2차 테스트: D_TERM_SCALE 상향(1차)은 악화 확인 후 원복 → 지연 자체를
+        #   더 정확히 보상하는 쪽으로 전환. 0.45→0.50(문서화된 안전 상한, "왕복이 남으면
+        #   0.50까지 ↑" 문구 그대로 적용). 실측지연 0.55s와의 잔여갭 0.10s→0.05s로 축소.
+        self.PREDICT_HORIZON_S   = 0.50    # [s] 0=예측 끔(비권장) [v6.7.1] 재실측 조향지연
+                                           #   0.55s(0703) 반영 0.40→0.45→0.50(2차 테스트, 상한).
         self.PREDICT_MAX_YAW_RAD = 0.60    # 예측 헤딩 전진 상한(±34°) — 스핀 시 폭주 방지
         self.imu_gyro_z    = 0.0           # [rad/s] /imu/data 요레이트(부호: CCW+)
         self.imu_last_time = None
@@ -398,7 +678,15 @@ class DrivingNode(Node):
         # 재측정법: 로스백에서 cmd 조향↔IMU 요레이트 상호상관 기울기.
         # [v6.7.1 재실측 0703] 우회전 게인 0.847(보정 후 실현율 1.00 ✓),
         #   좌회전 0.911(7% 과실현, 허용범위) → 0.85 유지.
-        self.STEER_PLANT_GAIN = 0.85       # (하위호환/기본값) 좌우 분리는 아래 L/R 사용
+        # ★★ [kasa 이식] 이 보정은 1.0(무보정)으로 되돌렸다 ★★
+        #   0.85 는 white 차량의 실측값이다(서보 스케일/링키지/슬립 15% 부족조향).
+        #   kasa B보드는 가변저항 피드백으로 ★조향각 PD 폐루프★를 돌아 명령각에 수렴한다
+        #   (kasa_0804_B.ino updateSteer, 하드리밋 좌576/우362 실측, 도달판정 ±3 raw).
+        #   즉 '명령 대비 실현 부족'을 아두이노가 이미 잡으므로, ROS 가 또 나누면 과조향이 된다.
+        #   재측정법: 이제 /steer_angle_measured(B보드 실측각, white 부호)가 상시 오므로
+        #     로스백에서 (실측각 / 명령각) 기울기를 직접 읽으면 된다. 1.0 에서 벗어나면
+        #     그 값을 아래 L/R 에 넣는다. (white 차량은 이 토픽이 옵션이라 요레이트로 역산해야 했다)
+        self.STEER_PLANT_GAIN = 1.0        # (하위호환/기본값) 좌우 분리는 아래 L/R 사용
 
         # ── [v6.7.2] ③-1b 조향 실효게인 좌/우 분리 ───────────────────────
         # 실측(0703 2차): 강한 우조향(raw<-6°) 구간 CTE 평균 -0.105m(바깥 언더스티어),
@@ -406,8 +694,11 @@ class DrivingNode(Node):
         # (÷게인이므로 게인↓ = 발행 조향↑). 좌는 양호하므로 0.85 유지.
         # 되돌리기: STEER_PLANT_GAIN_R을 0.85로 두면 v6.7.1과 동일(단일 게인).
         # 재측정: 다음 로스백에서 좌/우 조향별 CTE 평균이 둘 다 0 근처면 성공.
-        self.STEER_PLANT_GAIN_L = 0.85     # 좌회전(δ_ctrl>0) 실효게인 (실측 0.911)
-        self.STEER_PLANT_GAIN_R = 0.82     # 우회전(δ_ctrl<0) 실효게인 (실측 0.847) — 바깥밀림 보정
+        # ★ [kasa 이식] 좌/우 모두 1.0 (미측정) ★ 위 STEER_PLANT_GAIN 주석 참고.
+        #   0.85/0.82 는 white 차량 로스백에서 나온 값이라 그대로 쓰면 근거가 없다.
+        #   kasa 실차 로스백에서 좌/우 실현율이 비대칭으로 나오면 그때 분리한다.
+        self.STEER_PLANT_GAIN_L = 1.0      # 좌회전(δ_ctrl>0) 실효게인 (kasa 미측정)
+        self.STEER_PLANT_GAIN_R = 1.0      # 우회전(δ_ctrl<0) 실효게인 (kasa 미측정)
 
         # ── [v6.7.1] ③-2 조향 트림(직진 쏠림) 보정 ───────────────────────
         # 0703 로스백 실측: 직진 명령(|δ_pub|<1°) 중 요레이트 -3.64°/s, 그런데 정지 시
@@ -416,7 +707,11 @@ class DrivingNode(Node):
         # 정상상태 CTE +0.14m가 직선에 상시 잔류(회전 밀림 좌+0.18/우-0.07 비대칭의 주범).
         # 보정: 발행 직전 δ_pub = (δ_ctrl − TRIM)/GAIN.
         # 재측정법: 직진 로스백에서 |δ_pub|<1° 구간 gz평균 × L/v = 물리 트림각(부호 그대로).
-        self.STEER_TRIM_DEG = -1.5
+        # ★ [kasa 이식] -1.5 → 0.0 (미측정) ★ -1.5° 는 white 차량 로스백 실측값이다.
+        #   kasa 는 조향 하드리밋(좌576/우362)의 중앙이 곧 0° 이고 B보드가 그 매핑으로
+        #   PD 를 돌므로 기계적 트림이 있으면 B보드의 SAFETY_MARGIN/리밋값으로 잡는 것이
+        #   맞다. 실차에서 직진 명령(0°) 중 차가 한쪽으로 쏠리면 그 각도를 여기 넣는다.
+        self.STEER_TRIM_DEG = 0.0
 
         # ── [v6.7.1] ③-3 예측용 자이로 바이어스 자가학습 ─────────────────
         # 예측이 raw gz를 쓰므로 IMU 바이어스가 있으면 헤딩예측이 상시 기울어짐.
@@ -424,7 +719,8 @@ class DrivingNode(Node):
         self.gyro_bias_z = 0.0             # [rad/s]
 
         # ── [v6.7] ④ 스케줄링 안정화(게인 변조 억제) ─────────────────────
-        # 엔코더 양자화(1틱=0.283m/s)로 v_now가 떨려 LFD가 p90 1.28m/s로 출렁
+        # 엔코더 양자화(★kasa: 1카운트=0.442m/s★, 이전 white: 0.283m/s)로 v_now가 떨려
+        # LFD가 p90 1.28m/s로 출렁
         # → PP 게인(∝1/LFD²)이 진동주파수 대역에서 변조(파라메트릭 가진).
         # 테이블 조회 전용 저역 속도 + LFD 비대칭 슬루(감소는 빠르게=코너 보호 유지).
         self.V_SCHED_TAU   = 0.30          # [s] 테이블 조회용 속도 LPF
@@ -441,6 +737,12 @@ class DrivingNode(Node):
         self.CTE_DEADBAND_STRAIGHT = 0.06          # 직선 데드밴드[m] (잔떨림 무시)
         self.CTE_LPF_ALPHA   = 0.80
         self.D_TERM_LPF_ALPHA = 0.16
+        # [0714] D항 배율 — 1차 테스트(0.50) 결과: std/max 소폭악화 + 0.05m 정착비율
+        #   20.2%→15.7%, 정착구간 3회→0회로 오히려 나빠짐. d_term_lpf도 0.55s 지연 낀
+        #   값이라 D를 키우면 위상어긋난 채 더 세게 반응 → 감쇠가 아니라 진동 증폭 쪽으로
+        #   작동한 것으로 판단. 0.20 원복. D항 방향은 폐기 — 다음은 지연 자체(PREDICT_
+        #   HORIZON_S 재보정)를 다뤄야 함.
+        self.D_TERM_SCALE = 0.20           # [v6.5] 원복(1차 테스트 기각)
         # ── [v6.6.1] 지연 보상 — '시간상수' 폐지, '휠베이스 기하'로 정확 계산 ──────
         # 원리: GPS가 앞차축 정중앙 → 앞차축 CTE는 뒷차축 CTE보다 정확히 L·sin(θe) 앞섬
         #   (θe=경로접선−차량heading, L=휠베이스 0.73m). 이 기하로 '한 휠베이스 앞'의
@@ -449,7 +751,17 @@ class DrivingNode(Node):
         #   → 식에서 속도 v가 상쇄 → 속도추정(엔코더·바퀴둘레) 오차에 무관 → 강건·부드러움.
         #   (바퀴둘레 0.8482m/300틱은 속도 v 산출에 쓰이며, v는 LFD·게인 스케줄과
         #    곡률식 R=L/tan(δ)에 반영됨. 지연보상은 위처럼 순수 기하라 v와 독립.)
-        self.LEAD_WHEELBASE_MULT = 0.0             # [v6.7] 상태예측(PREDICT_HORIZON_S)이 지연보상을 전 채널에서
+        # [0713] 0.0→1.2→1.4: 직선 주행 로스백에서 잔여지연(PREDICT_HORIZON_S=0.45 vs 실측지연
+        #   0.55s 갭 약 0.1s)에 의한 지속 왕복 확인 → 주석의 "잔여지연 왕복 시 1.2~1.6 권장"에
+        #   따라 재활성화. 1.2 적용 후 재검증: 부호반전 시점에서 p_term이 cte보다 먼저 반응하는
+        #   lead 자체는 정상 작동(t=10.78~10.98 구간 확인)하나, 사이클별 p_term 진폭이
+        #   -0.33→+0.49→-0.57로 아직 소폭 성장 중 → 세기만 1.4로 소폭 증가(범위 안쪽, 1.6 여유 남김).
+        #   i_term 기여는 이전(LFD=4.4 테스트, ~0.26)보다 크게 줄어듦(~0.07) → Ki는 원인 아님.
+        #   코너 클램프(is_straight/step_limit)와는 별개 채널이라 코너 진입 시 클램프 해제
+        #   동작에는 영향 없음.
+        # [0713] 1.4 재검증 결과 1.2 대비 추가 개선 없음(p_term 사이클진폭 오히려 정체/미세증가,
+        #   +0.64→-0.82→+0.77) → 1.2로 원복. 다음 변수는 GAIN_TABLE의 Ki(위 표 참고)로 이동.
+        self.LEAD_WHEELBASE_MULT = 1.2             # [v6.7] 상태예측(PREDICT_HORIZON_S)이 지연보상을 전 채널에서
                                                    #   대체 → P채널 이중보상 방지 위해 0. (예측을 끄면 1.0 권장)
         self.LEAD_WHEELBASE = self.LEAD_WHEELBASE_MULT * self.vehicle_length   # [m]
         self.LEAD_CLAMP = 0.45                     # lead 기여 상한[m] (안전)
@@ -457,6 +769,17 @@ class DrivingNode(Node):
         self._cte_rate_lpf = 0.0
         # 주의: 잔여 지연이 남아 왕복이 있으면 MULT를 1.2~1.6(=1.2~1.6 휠베이스 preview)로,
         #       과보상으로 예민하면 0.8로. (여전히 물리단위=휠베이스 배수, 임의 시간 아님)
+        # [0714] 경로 접근 시 헤딩정렬 가중치. 부호반전 순간 헤딩이 경로 접선과 안 맞으면
+        #   반대편에서 CTE가 곧바로 다시 커진다는 지적 반영 — 반전 "전에" 헤딩부터 맞춰놔야
+        #   함. |cte|가 작을수록(경로에 가까울수록) lead(=헤딩오차 반영분)의 가중치를 올려서,
+        #   위치보다 헤딩정렬을 우선하게 만든다. |cte|≥REF면 가중치 1.0(기존과 동일).
+        # [0714 2차] REF 0.15→0.45: 로스백(15_33_25) 실측 — 부호반전 순간마다 헤딩이 8°씩
+        #   어긋난 채 통과(오버슛 0.12→0.21→0.39m 성장). 0.15m 존은 2.3m/s·8° 접근 시
+        #   0.5s만에 통과 → 조향지연 0.55s보다 짧아 부스트가 반전 전에 못 듣던 구조.
+        #   0.45로 넓히면 정렬이 3배 일찍 시작되고 접근각 스케줄이 완만해짐
+        #   (cte=0.3→15°, 0.2→8°, 0.1→4°; 기존엔 0.3→20°, 0.2→13°).
+        self.HEADING_ALIGN_CTE_REF = 0.45           # 이 |cte|[m] 이상이면 가중치 1.0(부스트 없음)
+        self.HEADING_ALIGN_BOOST   = 1.0            # |cte|≈0일 때 lead 가중치 = 1.0+1.0 = 2.0배
         self.PID_STEER_LIMIT = 9.0                 # PID 단독 조향 상한(PP 보조)
         self.cte_integral = 0.0
         self.prev_cte     = 0.0
@@ -472,6 +795,7 @@ class DrivingNode(Node):
         self.JITTER_CTE_M      = 0.08              # 이 이하 CTE면
         self.JITTER_STEER_DEG  = 3.0               # 이 이하 조향명령은
         self.JITTER_ZERO_DEG   = 0.7               # 이 이하면 0으로, 아니면 수축
+        self.JITTER_LEAD_M     = 0.05              # [0714] lead(헤딩오차)가 이 이상이면 잔떨림으로 안 봄(억제 금지)
 
         # ── 속도 PI(목표속도 미세보정) ────────────────────────────────────
         self.spd_kp = 0.08
@@ -484,15 +808,29 @@ class DrivingNode(Node):
         self.STEER_STEP_LOW_DEG  = 2.5             # 저속(코너) 빠른 응답 허용
         self.STEER_STEP_HIGH_DEG = 3.2             # 고속 급변 완화
         self.STEER_STEP_RECOVER_DEG = 3.5          # [v6.1] 큰 CTE 회복 허용(5.0→3.5, 급수정 완화)
+        # [2026-07-29] 조향 스텝 보간용 속도 정규화 기준.
+        #   기존엔 (v-min)/(max_speed_ms-min) 이라 max_speed_ms 를 바꾸면 분모가 변해
+        #   '같은 실제속도인데 다른 스텝상한'이 적용됐다(2.8→2.2 시 분모 1.8→1.2 로
+        #   같은 v=1.6 에서 ratio 0.33→0.50). 스텝상한은 절대속도의 물리(횡가속·LFD)에
+        #   묶여야 하므로, 게인을 튜닝했던 기준범위로 고정해 상한 변경과 분리한다.
+        self.STEER_RATIO_REF_MIN = 1.0             # 튜닝 기준 하한[m/s]
+        self.STEER_RATIO_REF_MAX = 2.8             # 튜닝 기준 상한[m/s] (GAIN/LFD_TABLE 최상단과 동일)
+        # [0713] is_straight 판정 시 전용 상한(속도 무관, 코너용보다 훨씬 낮게).
+        #   직선에서 30cm 반경 S자 왕복 반복 실측 → 좌우 반전 속도 자체를 둔화시켜 왕복 횟수를 줄임.
+        #   단, JITTER_CTE_M(8cm) 데드밴드보다 큰 중간 진폭 오차엔 안 걸리던 구간을 커버.
+        #   CTE_RECOVER 조건(cte>0.55 또는 raw_steer>12°)은 그대로 우선 적용돼 안전 유지.
+        self.STEER_STEP_STRAIGHT_DEG = 1.3
         self.prev_steer = 0.0
 
         # ── 종점 정지/접근(APPROACH) ──────────────────────────────────────
         self.APPROACH_START_DIST = 9.0             # [v6.4] 14→9: 접근 크롤 구간 단축(전체 평균속도↑)
         self.APPROACH_END_SPEED  = 0.10
         self.FINAL_APPROACH_WP_WINDOW = 90
-        self.FINAL_APPROACH_ENTRY_SPEED = 2.6      # [v6.4] 2.4→2.6 접근 진입속도(덜 굼뜨게)
+        # FINAL_APPROACH_ENTRY_SPEED 는 _apply_speed_scaling() 이 상한에서 비례 산출.
+        #   원본(@max 2.8): 2.6 — 상한보다 크면 접근 캡이 안 걸려 무효가 되므로 비례화했다.
         self.FINAL_HEADING_ALIGN_DIST = 2.0        # [v6.3] 8.0→2.0: 종점 2m 전까지 실제 경로 추종
                                                    #   (8m부터 직선타깃을 쫓아 곡선구간에서 CTE 1.2m 폭발하던 문제 수정)
+        self.FINAL_BLEND_BAND = 2.0                 # [0714] 이 구간(2~4m) 동안 waypoint→최종타깃 선형블렌딩(순간전환 방지)
         self.FINAL_HEADING_TOL_DEG = 22.0
         self.FINAL_CREEP_DIST  = 2.0               # 종점 2m 이내 크리프
         self.FINAL_CREEP_SPEED = 0.85
@@ -531,8 +869,29 @@ class DrivingNode(Node):
         self.imu_pitch    = 0.0
         self.dr_active    = False
         self.gps_blend_on = False
+
+        # [카메라 융합] /lane_metrics 최신값 + 횡보정 상태
+        self.cam_cte_now   = 0.0     # /lane_metrics[0] cte_rear_m (우측+)
+        self.cam_conf_now  = 0.0     # /lane_metrics[4] conf_eff
+        self.cam_lane_time = 0.0
+        self.cam_lat_bias  = 0.0     # 누적 횡보정량 [m] (ctrl 자세에 적용, 우측+)
+        self._cam_lat_err  = 0.0     # 이번 틱 측정 횡오차 [m] (섀도 로깅용)
+        self._cam_lat_ok   = False   # 이번 틱 게이트 통과 여부
+        self._cam_cte_map  = 0.0     # 이번 틱 맵 기준값 [m]
+        self._last_cte_for_cam = 0.0 # 직전 틱 CTE(제어가 믿는 횡오차) — 잔차 계산용
+        self.route_has_lane = False  # 로드된 맵에 lane_cte 컬럼이 있는가
         self.prev_gps_blend_on = False
         self.last_gps_blend_event_time = 0.0
+
+        # ── [신호등 정지 인지] camera_judgment 게이트가 차를 세우는 동안 driving 내부상태 동결 ──
+        #   driving 은 /cmd_vel_drive 를 계속 내지만 하류 게이트(camera_judgment)가 속도를 0 으로
+        #   덮어 차가 멈춘다. driving 이 이를 모르면 ①출발 타이머 소진 ②슬루 무시 급출발
+        #   ③속도PI 와인드업 이 생긴다. /judgment_state 를 구독해 정지(TL_STOP) 중엔 진행·시계·
+        #   적분을 멈추고, 초록불(PASS) 복귀 시 점진가속을 새로 시작한다.
+        self.judgment_state = "PASS"     # camera_judgment 최신 상태
+        self.judgment_time  = 0.0        # 마지막 수신 time.time()
+        self._was_gate_stopped = False   # 직전 틱 정지동결 여부(복귀 엣지 감지용)
+        self.GATE_STATE_MAX_AGE = 1.5    # [s] 이보다 오래되면 미수신 취급(camera_judgment 1Hz 재발행)
 
         self.waypoints = []
         self.wp_idx    = 0
@@ -558,12 +917,34 @@ class DrivingNode(Node):
         self.create_subscription(Imu,               "/imu/data",      self.cb_imu,        20)  # [v6.7] 예측용 요레이트
         self.create_subscription(Float64MultiArray, "/terrain_state", self.cb_terrain,    10)  # [v6.3.1] 원본과 동일하게 복원
         self.create_subscription(String,            "/gps_status",    self.cb_gps_status, 10)
+        self.create_subscription(Float32MultiArray, "/lane_metrics",  self.cb_lane_metrics, 10)  # [카메라 융합]
+        self.create_subscription(String,            "/judgment_state", self.cb_judgment_state, 10)  # [신호등 정지]
 
-        self.drive_pub  = self.create_publisher(Twist,             "/cmd_vel_raw",   10)
+        # [카메라 융합] 출력 토픽 파라미터화 — 카메라 게이트(camera_judgment) 사용 시
+        #   launch 에서 cmd_vel_topic:=/cmd_vel_drive 로 바꿔 게이트를 경유(→/cmd_vel_raw→motor).
+        #   카메라 OFF(게이트 미기동) 시 기본값 /cmd_vel_raw 로 motor 직결 → GPS 단독 주행 유지.
+        self.declare_parameter("cmd_vel_topic", "/cmd_vel_raw")
+        _cmd_topic = str(self.get_parameter("cmd_vel_topic").value)
+        self.drive_pub  = self.create_publisher(Twist,             _cmd_topic,       10)
+        # ★★ [kasa 이식] /cmd_vel_raw 는 linear.x 가 m/s 가 아니라 '펄스 목표값 0~15' 다 ★★
+        #   nxde/arduino.py 가 그 값을 A보드에 그대로 넘긴다. 그래서 이 노드가 /cmd_vel_raw
+        #   로 직결 발행할 때는 publish_cmd 에서 m/s → 펄스 환산을 해야 한다.
+        #   반대로 /cmd_vel_drive(카메라 게이트 경유)로 낼 때는 ★m/s 를 그대로★ 보낸다 —
+        #   camera_judgment 가 v=√(2·a·d) 같은 물리식으로 정지·서행 상한을 계산하므로
+        #   그 입력이 펄스면 식이 성립하지 않는다. 환산은 게이트의 출력단이 담당한다
+        #   (camera_judgment.cb_cmd 참고). 즉 ★환산은 /cmd_vel_raw 를 발행하는 노드가 한다★.
+        self._publish_pulse = (_cmd_topic == "/cmd_vel_raw")
+        self.get_logger().info(
+            f"[kasa] 출력 토픽 {_cmd_topic} → linear.x 단위 = "
+            f"{'펄스(0~15)' if self._publish_pulse else 'm/s (게이트가 펄스로 환산)'}")
         self.state_pub  = self.create_publisher(Bool,              "/control_state", 10)
         self.status_pub = self.create_publisher(String,            "/drive_status",  10)
         self.event_pub  = self.create_publisher(String,            "/drive_event",   10)
         self.debug_pub  = self.create_publisher(Float64MultiArray, "/driving_debug", 10)
+
+        # 파라미터 런타임 전환 — 모든 declare_parameter 뒤에 등록한다(등록이 앞서면
+        # 이후 declare 들이 이 콜백을 타게 된다).
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         self.create_timer(0.05, self.control_loop)   # 20Hz
 
@@ -588,10 +969,29 @@ class DrivingNode(Node):
         else:
             self.get_logger().info(msg)
 
+    def _apply_speed_scaling(self):
+        """max_speed_ms 에서 하한·속도캡들을 비례 산출한다(상한 변경 시마다 호출).
+
+        캡을 절대값으로 두면 상한을 낮출 때 '상한 이상인 캡'이 조용히 무효가 된다.
+        비율로 두면 상한만 바꿔도 감속 프로파일의 모양이 그대로 유지된다.
+        """
+        mx = self.max_speed_ms
+        self.min_speed_ms = min(mx, max(MIN_SPEED_FLOOR, mx * MIN_SPEED_RATIO))
+        # 캡이 하한보다 낮아도 무방(하류에서 max(min_speed,...) 로 클램프됨).
+        self.CTE_RECOVER_CAPS = [(thr, round(mx * r, 3)) for thr, r in CTE_RECOVER_CAP_RATIOS]
+        self.STEER_SPEED_CAPS = [(thr, round(mx * r, 3)) for thr, r in STEER_SPEED_CAP_RATIOS]
+        self.FINAL_APPROACH_ENTRY_SPEED = round(mx * APPROACH_ENTRY_RATIO, 3)
+
     # ══════════════════════════════════════════════════════════════════════
     #  콜백
     # ══════════════════════════════════════════════════════════════════════
     def cb_encoder(self, msg: Int32):
+        """/encoder — ★[kasa] A보드 좌+우 펄스의 합(부호 없음)★ 20Hz(50ms) 도착.
+
+        white 차량에서는 '부호 있는 틱/10ms 창'이었고 음수가 후진을 뜻했다. kasa 는
+        후진을 수동조종으로만 하므로 여기 오는 값은 항상 0 이상이다 → 아래 부호 관련
+        분기(abs)는 그대로 두어도 무해하지만, current_speed_ms 가 음수가 되는 경로는
+        더 이상 없다(ego_speed 대입 경로 제외)."""
         raw = float(msg.data)
         speed_raw = self.ticks_to_speed_ms(raw)
         now = time.time()
@@ -601,10 +1001,142 @@ class DrivingNode(Node):
             dt = max(0.001, min(0.1, now - self.encoder_last_time))
             alpha = dt / (self.ENCODER_SPEED_LPF_TAU + dt)
             self.current_speed_ms += alpha * (speed_raw - self.current_speed_ms)
+            # 0.5 는 '카운트' 단위 임계다 — 단위가 바뀌었으니 물리적 의미도 바뀌었다.
+            #   white : 0.5틱   = 0.14 m/s
+            #   kasa  : 0.5카운트 = 0.22 m/s
+            # /encoder 가 정수라 실질적으로는 "raw == 0 일 때만" 걸린다. 그리고 and 조건의
+            # 뒤쪽(속도도 충분히 작음)까지 함께 봐야 하므로 오작동 위험은 낮다.
             if abs(raw) < 0.5 and abs(self.current_speed_ms) < self.min_speed_ms * 0.5:
                 self.current_speed_ms = 0.0
         self.current_encoder_ticks_lpf = self.speed_ms_to_ticks_float(self.current_speed_ms)
         self.encoder_last_time = now
+
+    def _on_set_parameters(self, params):
+        """[카메라 융합] cam_lat_enable 런타임 전환.
+        섀도 계측(driving_debug 27~31)은 이 값과 무관하게 계속 기록되므로,
+        OFF 로 되돌려도 사후분석 데이터는 끊기지 않는다."""
+        for p in params:
+            if p.name == "cam_lat_enable":
+                old = self.CAM_LAT_ENABLE
+                self.CAM_LAT_ENABLE = bool(p.value)
+                self.get_logger().warn(
+                    f"[카메라 융합] CAM_LAT_ENABLE 전환: "
+                    f"{'ON' if old else 'OFF'} → {'ON' if self.CAM_LAT_ENABLE else 'OFF'}"
+                    + (" — ⚠ 미해결 3건(노이즈 유색/DR 미검증/slope 0.70) 확인 후 사용"
+                       if self.CAM_LAT_ENABLE else " (섀도 계측만 유지)"))
+            elif p.name == "max_speed_ms":
+                # [속도 상한 런타임 튜닝] 실차 능력에 맞춰 주행 중에도 조정 가능.
+                #   하한·속도캡들을 _apply_speed_scaling() 이 함께 재산출한다 →
+                #   상한만 바꿔도 캡이 무효화되지 않고 감속 프로파일 모양이 유지된다.
+                old = self.max_speed_ms
+                # [kasa] 차량 물리 상한(펄스 15 = 13.26 m/s)을 넘는 값은 A보드에서 잘린다
+                self.max_speed_ms = min(max(0.3, float(p.value)), ku.MAX_SPEED_MS_LIMIT)
+                self._apply_speed_scaling()
+                self.get_logger().warn(
+                    f"[속도] max_speed_ms 전환: {old:.2f} → {self.max_speed_ms:.2f} m/s "
+                    f"(≈{ku.ms_to_pulse(self.max_speed_ms)}펄스) "
+                    f"| min {self.min_speed_ms:.2f} "
+                    f"| CTE캡 {[c for _, c in self.CTE_RECOVER_CAPS]} "
+                    f"| 조향캡 {[c for _, c in self.STEER_SPEED_CAPS]} "
+                    f"| 접근진입 {self.FINAL_APPROACH_ENTRY_SPEED:.2f}")
+        return SetParametersResult(successful=True)
+
+    def cb_lane_metrics(self, msg: Float32MultiArray):
+        """[카메라 융합] camera_judgment /lane_metrics[10] 수신. 판단은 control_loop 에서."""
+        d = msg.data
+        if len(d) < 7:
+            return
+        self.cam_cte_now   = float(d[0])   # cte_rear_m (우측+)
+        self.cam_conf_now  = float(d[4])   # conf_eff (치명 게이트 실패 시 0)
+        self.cam_lane_time = time.time()
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  [카메라 융합] GPS 단절 중 차선 기반 횡위치 보정
+    # ══════════════════════════════════════════════════════════════════════
+    def _measure_cam_lat_err(self, now):
+        """매핑 선 대비 횡오차를 측정한다. → (횡오차[m], 유효여부)
+
+        횡오차 = cte_now − lane_cte[wp_idx]  (둘 다 우측+, 같은 카메라 → 계통편향 상쇄)
+        게이트를 하나라도 못 넘으면 (0.0, False). 측정만 하며 제어에는 개입하지 않는다.
+        """
+        self._cam_cte_map = 0.0
+        if not self.route_has_lane or not self.waypoints:
+            return 0.0, False
+        # [후진] 후진 구간은 카메라 융합 제외 — 전방 카메라가 진행 반대편을 보므로 차선
+        #   횡오차가 무의미하다(후진 정밀기동은 추후 라이다 융합으로 대체 예정).
+        if self.waypoints[min(self.wp_idx, len(self.waypoints) - 1)].get('direction', 1) == -1:
+            return 0.0, False
+        # 신선도
+        if self.cam_lane_time <= 0.0 or (now - self.cam_lane_time) > self.CAM_LAT_MAX_AGE:
+            return 0.0, False
+        # 현재 카메라 신뢰도(양쪽차선). conf_eff 는 치명 flags 시 0 이라 이 하나로 흡수된다.
+        if self.cam_conf_now < self.CAM_LAT_CONF_MIN:
+            return 0.0, False
+        # 맵 쪽 신뢰도 — 매핑 때 이 지점에서 양쪽 차선을 봤어야 편향상쇄가 성립한다.
+        wp = self.waypoints[min(self.wp_idx, len(self.waypoints) - 1)]
+        if wp['lane_conf'] < self.CAM_LAT_CONF_MIN:
+            return 0.0, False
+        # 직진 게이트 — 코너에선 theta 곡률오염이 cte_rear 에도 새어든다(cte_rear=cte_near+d·sinθ).
+        if abs(self.imu_gyro_z - self.gyro_bias_z) > self.CAM_LAT_MAX_GYRO:
+            return 0.0, False
+
+        self._cam_cte_map = wp['lane_cte']
+        err = self.CAM_LAT_SIGN * (self.cam_cte_now - wp['lane_cte'])
+        if abs(err) > self.CAM_LAT_MAX_ERR_M:
+            return 0.0, False   # 오검출 의심
+        return err, True
+
+    def _update_cam_lat_bias(self, err, ok):
+        """측정 횡오차로 누적 보정량(cam_lat_bias)을 갱신한다. 미개입 시 서서히 0으로 감쇠.
+
+        잔차 = (카메라가 본 실제 횡오차) − (제어가 믿고 있는 횡오차=직전 CTE).
+        DR 중엔 위치추정이 밀리므로 이 잔차가 곧 DR 드리프트다. 저게인으로 수렴시킨다.
+        """
+        engaged = (self.CAM_LAT_ENABLE and ok
+                   and (self.dr_active or not self.CAM_LAT_DR_ONLY))
+        if not engaged:
+            # 차선 두절/게이트 차단/DR 이탈 → bias 를 서서히 풀어 스텝 없이 기존 거동 복귀
+            self.cam_lat_bias *= self.CAM_LAT_DECAY
+            if abs(self.cam_lat_bias) < 1e-3:
+                self.cam_lat_bias = 0.0
+            return
+        residual = err - self._last_cte_for_cam
+        step = self.CAM_LAT_GAIN * residual
+        step = max(-self.CAM_LAT_MAX_STEP_M, min(self.CAM_LAT_MAX_STEP_M, step))
+        self.cam_lat_bias = max(-self.CAM_LAT_MAX_BIAS_M,
+                                min(self.CAM_LAT_MAX_BIAS_M, self.cam_lat_bias + step))
+
+    def _apply_cam_lat_bias(self, psi, R):
+        """cam_lat_bias 만큼 ctrl 자세를 헤딩 법선방향으로 민다(우측+).
+
+        ctrl_lat/lon 은 WP탐색·CTE·PP 가 모두 참조하는 제어 전용 자세라, 여기 한 곳만
+        밀면 조향 전 채널이 보정된 자세를 본다. 도착판정은 원시좌표를 쓰므로 무영향.
+        x=동, y=북, heading=atan2(dy,dx) → 우측법선 = (sinψ, −cosψ)
+        """
+        if abs(self.cam_lat_bias) < 1e-6 or self.ctrl_lat is None:
+            return
+        e = self.cam_lat_bias
+        d_north = -e * math.cos(psi)
+        d_east  =  e * math.sin(psi)
+        self.ctrl_lat += math.degrees(d_north / R)
+        self.ctrl_lon += math.degrees(d_east / (R * math.cos(math.radians(self.ctrl_lat))))
+
+    def _dist_to_cusp(self, cur_dir):
+        """현재 WP 앞쪽에서 direction 이 바뀌는 전환점(cusp)까지의 경로거리[m].
+        CUSP_SEARCH_WP 창 안에 전환점이 없으면 inf. 방향 전환 급브레이크 방지용 감속에 사용."""
+        R = 6378137.0
+        acc = 0.0
+        end = min(self.wp_idx + self.CUSP_SEARCH_WP, len(self.waypoints))
+        for i in range(self.wp_idx, end - 1):
+            a, b = self.waypoints[i], self.waypoints[i + 1]
+            dx = math.radians(b['lon'] - a['lon']) * math.cos(math.radians(a['lat'])) * R
+            dy = math.radians(b['lat'] - a['lat']) * R
+            acc += math.hypot(dx, dy)
+            if b['direction'] != cur_dir:      # a→b 사이에서 방향이 바뀜 = 전환점
+                return acc
+            if acc > self.CUSP_SLOWDOWN_DIST:   # 감속창을 벗어나면 더 볼 필요 없음
+                return float('inf')
+        return float('inf')
 
     def cb_imu(self, msg: Imu):
         # [v6.7] 지연보상 예측용 요레이트(rad/s, CCW+). 가벼운 LPF로 잡음만 억제.
@@ -666,6 +1198,18 @@ class DrivingNode(Node):
         self.prev_gps_blend_on = new_blend
         self.gps_blend_on = new_blend
 
+    def cb_judgment_state(self, msg: String):
+        """[신호등 정지] camera_judgment 게이트 상태. TL_STOP = 게이트가 차를 세우는 중."""
+        self.judgment_state = msg.data.strip()
+        self.judgment_time  = time.time()
+
+    def _gate_stop_held(self):
+        """게이트가 지금 차를 '정지 유지' 중인가. 신선도 게이트로 camera_judgment 두절 시
+        무한 동결(자동주행 불능)을 막는다 — 두절 시엔 False(정상 진행)로 폴백."""
+        if self.judgment_state != "TL_STOP":
+            return False
+        return (time.time() - self.judgment_time) <= self.GATE_STATE_MAX_AGE
+
     def cb_drive_cmd(self, msg: String):
         cmd = msg.data.strip()
         self.get_logger().info(f"📩 /drive_cmd 수신: '{cmd}'")   # [v6.3.1] 명령 하달 확인용
@@ -686,11 +1230,20 @@ class DrivingNode(Node):
         raw_wps = []
         with open(path, 'r') as f:
             for row in csv.DictReader(f):
-                raw_wps.append({
+                wp = {
                     'lat': float(row['latitude']),
                     'lon': float(row['longitude']),
                     'direction': int(float(row.get('direction', '1'))),
-                })
+                }
+                # [카메라 융합] lane_cte 는 신형 맵에만 있다. .get() 폴백이라 구형 맵도 그대로 로드되고,
+                #   그 경우 lane_conf=0 → 횡보정 게이트가 항상 닫혀 기존 동작과 동일해진다.
+                wp['lane_cte']  = _safe_float(row.get('lane_cte'),  0.0)
+                wp['lane_conf'] = _safe_float(row.get('lane_conf'), 0.0)
+                # [카메라 융합 Phase1] lane_theta(지도접선−헤딩)/lane_curv — 최신 맵에만.
+                #   현재 driving 은 로드만 하고 미사용. 헤딩 기반 맵대조 도입 시 사용 예정.
+                wp['lane_theta'] = _safe_float(row.get('lane_theta'), 0.0)
+                wp['lane_curv']  = _safe_float(row.get('lane_curv'),  0.0)
+                raw_wps.append(wp)
         if not raw_wps:
             self.publish_event("❌ WP가 없습니다!", level="error")
             return
@@ -721,8 +1274,21 @@ class DrivingNode(Node):
 
         self.waypoints = raw_wps[:cut_idx]
 
+        # [카메라 융합] 이 맵으로 GPS단절 횡보정을 쓸 수 있는가 + 커버리지 보고
+        n_lane = sum(1 for w in self.waypoints if w['lane_conf'] >= self.CAM_LAT_CONF_MIN)
+        self.route_has_lane = n_lane > 0
+        if self.route_has_lane:
+            pct = 100.0 * n_lane / max(1, len(self.waypoints))
+            self.publish_event(
+                f"📷 맵 차선 커버리지: {n_lane}/{len(self.waypoints)} ({pct:.1f}%) | "
+                f"횡보정={'ON' if self.CAM_LAT_ENABLE else 'OFF(섀도 계측만)'}")
+        else:
+            self.publish_event("📷 맵에 차선 데이터 없음 — GPS단절 횡보정 비활성(기존 동작)")
+
         # 상태 초기화
         self.wp_idx = 0
+        self.cam_lat_bias = 0.0
+        self._last_cte_for_cam = 0.0
         self.cte_integral = 0.0
         self.prev_cte = 0.0
         self.cte_lpf = 0.0
@@ -799,9 +1365,13 @@ class DrivingNode(Node):
         steer_out = (float(steer_deg) - self.STEER_TRIM_DEG) / max(0.5, plant_gain)
         steer_out = max(-self.STEER_MAX_DEG, min(self.STEER_MAX_DEG, steer_out))
         msg = Twist()
-        msg.linear.x  = speed_ms
-        msg.angular.z = steer_out
+        # ★ [kasa 이식] 단위 분기 ★ 위 self._publish_pulse 주석 참고.
+        #   조향 부호는 여기서 뒤집지 않는다 — ROS 안은 white 부호(+좌)로 통일하고,
+        #   kasa 부호(+우)로의 반전은 nxde/arduino.py 가 시리얼 전송 직전에 한다.
+        msg.linear.x  = float(ku.ms_to_pulse(speed_ms)) if self._publish_pulse else speed_ms
+        msg.angular.z = ku.clamp_steer_deg(steer_out)
         self.drive_pub.publish(msg)
+        # 내부 기록·디버그는 계속 m/s 다(튜닝 수치의 의미를 보존한다)
         self.last_published_speed = speed_ms
 
     def instant_stop(self):
@@ -1044,15 +1614,24 @@ class DrivingNode(Node):
         self.last_control_time = now_ctl
 
         if not self.active or not self.waypoints or self.current_lat is None:
-            # [v6.3.1] 진단: 활성인데 못 나가는 이유를 2초마다 알림(하달 안 될 때 원인 노출)
+            # ★★ [kasa 이식 / 안전] 계산할 수 없으면 '정지 명령을 계속 발행'한다 ★★
+            #   이전(white 차량)에는 여기서 그냥 return 했다. /cmd_vel_raw 발행이 끊기면
+            #   아두이노의 RX 워치독이 모터를 세워 줬기 때문이다.
+            #   ★ kasa A보드에는 무입력 타임아웃이 없다(0713에서 제거) ★ 게다가
+            #   nxde/arduino.py 는 마지막 명령을 KEEPALIVE_S(1초) 주기로 계속 재전송한다.
+            #   즉 '발행을 멈추는 것'이 정지가 아니라 ★마지막 주행값 유지 = 계속 주행★ 이다.
+            #   GPS 두절 중에 그러면 통제 불능이 되므로 여기서 명시적으로 0 을 낸다.
+            #   조향은 0 이 아니라 마지막 값(prev_steer)을 유지한다 — 정지하는 순간 바퀴가
+            #   정면으로 튀면 오히려 위험하다.
             if self.active:
+                self.publish_cmd(0.0, self.prev_steer)
                 now_w = time.time()
                 if now_w - getattr(self, '_last_wait_log', 0.0) > 2.0:
                     self._last_wait_log = now_w
                     if not self.waypoints:
-                        self.get_logger().warning("⏳ 주행 대기: 경로(waypoints) 비어있음 — /drive_cmd 파일 로드 실패 확인")
+                        self.get_logger().warning("⏳ 주행 대기: 경로(waypoints) 비어있음 — /drive_cmd 파일 로드 실패 확인 (정지 명령 발행 중)")
                     elif self.current_lat is None:
-                        self.get_logger().warning("⏳ 주행 대기: /ego_state(GPS) 미수신 — gps_imu 노드/GPS fix 확인 (이 경우 /cmd_vel_raw 미발행→아두이노 워치독이 모터 정지)")
+                        self.get_logger().warning("⏳ 주행 대기: /ego_state(GPS) 미수신 — gps_imu 노드/GPS fix 확인 (★정지 명령 발행 중★ — kasa 는 발행을 멈추면 마지막 값이 계속 재전송되므로 반드시 0 을 내야 한다)")
             return
 
         R = 6378137.0
@@ -1086,9 +1665,29 @@ class DrivingNode(Node):
             imu_fresh_pred = False
             self.ctrl_lat, self.ctrl_lon = self.current_lat, self.current_lon
 
+        # ─────────────────────────────────────────────────────────────────
+        # [카메라 융합] GPS 단절 중 차선 기반 횡보정 — ctrl 자세에만 주입.
+        #   측정(_measure)은 항상 수행해 /driving_debug 로 내보낸다(Phase1 섀도 검증용).
+        #   실제 주입(_apply)은 CAM_LAT_ENABLE + DR 게이트를 통과할 때만 일어난다.
+        #   반드시 WP탐색·CTE·PP 앞에서 적용해야 전 채널이 보정된 자세를 본다.
+        # ─────────────────────────────────────────────────────────────────
+        self._cam_lat_err, self._cam_lat_ok = self._measure_cam_lat_err(now_ctl)
+        self._update_cam_lat_bias(self._cam_lat_err, self._cam_lat_ok)
+        self._apply_cam_lat_bias(psi, R)
+
         cur_dir = self.waypoints[self.wp_idx]['direction']
         is_rev  = (cur_dir == -1)
         psi_eff = (psi + math.pi) if is_rev else psi
+
+        # ── [신호등 정지] 게이트 정지 유지 여부 + 초록불 복귀 엣지 처리 ──────────
+        #   복귀 순간 drive_start_time 을 '지금'으로 리베이스 → 점진가속(ramp_up)·초기정렬
+        #   (START_ALIGN)이 정지 중 소진되지 않고 초록불에 새로 시작한다. (출발 직후 빨간불도 동일 적용)
+        gate_held = self._gate_stop_held()
+        if self._was_gate_stopped and not gate_held:
+            self.drive_start_time = time.time()
+            self.ramp_up_active   = True
+            self._was_gate_stopped = False
+            self.publish_event("🟢 신호 해제 → 점진가속 재출발")
         elapsed_drive = max(0.0, time.time() - self.drive_start_time) if self.drive_start_time else 0.0
 
         # ─────────────────────────────────────────────────────────────────
@@ -1119,7 +1718,10 @@ class DrivingNode(Node):
                 min_ahead, best_ahead = d, i
         best = best_any if (best_ahead is None or min_ahead > min_any + 1.2) else best_ahead
         best = max(self.wp_idx, min(best, self.wp_idx + max_advance))
-        self.wp_idx = best
+        # [신호등 정지] 정지 유지 중엔 wp_idx 동결 — 위치기반이라 대체로 안 밀리지만,
+        #   정지 중 GPS 지터로 앞 WP 로 기어드는 것까지 확실히 막는다.
+        if not gate_held:
+            self.wp_idx = best
 
         # ─────────────────────────────────────────────────────────────────
         # 인지 2. 도착 판정 / 종점 거리
@@ -1221,6 +1823,9 @@ class DrivingNode(Node):
         cte = max(-4.0, min(4.0, self.cte_lpf))
         self.wp_idx = max(self.wp_idx, cte_seg_idx)
         cte_abs = abs(cte)
+        # [카메라 융합] 다음 틱의 잔차 계산용. 이 cte 는 보정된 ctrl 자세로 계산된 값이라,
+        #   'bias 를 키우면 cte 가 커진다'는 음의 되먹임이 성립한다 → err 로 수렴한다.
+        self._last_cte_for_cam = cte
 
         # ── [v6.6.1] 지연 보상: 휠베이스 기하로 '한 휠베이스 앞' CTE 예측 ──────────
         #   앞차축 CTE(cte) + L·sin(θe) = 앞차축보다 L 앞선 지점의 CTE (θe=경로접선−heading).
@@ -1239,7 +1844,11 @@ class DrivingNode(Node):
         else:
             lead_raw = 0.0
         self._cte_rate_lpf += self.LEAD_RATE_LPF_ALPHA * (lead_raw - self._cte_rate_lpf)
-        cte_lead = max(-self.LEAD_CLAMP, min(self.LEAD_CLAMP, self._cte_rate_lpf))
+        # [0714] 경로 접근 시(|cte| 작을수록) 헤딩정렬(lead) 가중치를 올려서 부호반전 전에
+        # 헤딩부터 맞추게 함. |cte|≥HEADING_ALIGN_CTE_REF면 boost=1.0(기존과 동일 동작).
+        align_boost = 1.0 + self.HEADING_ALIGN_BOOST * (
+            1.0 - min(1.0, cte_abs / self.HEADING_ALIGN_CTE_REF))
+        cte_lead = max(-self.LEAD_CLAMP, min(self.LEAD_CLAMP, self._cte_rate_lpf * align_boost))
         cte_ctrl = max(-4.0, min(4.0, cte + cte_lead))   # 지연보상된 제어용 CTE (앞차축 기하 예측)
 
         is_straight = (far_peak_deg < self.JITTER_DEMAND_DEG)   # [v6.7.3 감사수정] 피크 기준:
@@ -1355,6 +1964,20 @@ class DrivingNode(Node):
                 v_target = cte_cap
                 reason = "CTE_RECOVERY"
 
+        # (d) [0714] 직선 실조향각 반응 감속 — 경로는 직선인데 조향이 크게 흔들릴 때만.
+        #   is_straight 게이트라 코너 진입(far_peak 선행감지로 is_straight가 먼저 꺼짐)엔
+        #   전혀 개입 안 함 → 이중감속 없음.
+        if is_straight and not approach_active:
+            steer_mag = abs(self.prev_steer)
+            if steer_mag > self.STEER_SPEED_START_DEG:
+                steer_cap = self.max_speed_ms
+                for thr, cap in self.STEER_SPEED_CAPS:
+                    if steer_mag >= thr:
+                        steer_cap = cap
+                if steer_cap < v_target:
+                    v_target = steer_cap
+                    reason = "STEER"
+
         v_target = max(self.min_speed_ms, min(self.max_speed_ms, v_target))
 
         # DR 감속
@@ -1388,10 +2011,11 @@ class DrivingNode(Node):
                 self.ramp_up_active = False
                 self.publish_event("✅ 점진 가속 완료 → 정상 속도")
 
-        # 정상주행 하한(접근/DR/램프 제외)
+        # 정상주행 하한(접근/DR/램프 제외) — [후진] 저속 정밀주행이라 낮은 하한 사용
         normal_floor = (not self.ramp_up_active and not self.dr_active and not approach_active)
+        floor_speed = self.REV_MIN_SPEED if is_rev else self.min_speed_ms
         if normal_floor:
-            v_target = max(self.min_speed_ms, v_target)
+            v_target = max(floor_speed, v_target)
 
         # 속도 슬루레이트 (가속 부드럽게 / 감속 빠르게)
         max_accel = self.MAX_ACCEL_PER_S * loop_dt
@@ -1409,13 +2033,40 @@ class DrivingNode(Node):
             reason = "DECEL_LIMIT"
 
         if normal_floor:
-            v_target = max(self.min_speed_ms, v_target)
+            v_target = max(floor_speed, v_target)
         v_target = max(self.safe_stop_speed, v_target)
 
         # APPROACH 캡 최종 적용
         if approach_active and approach_speed_cap < v_target:
             v_target = max(self.safe_stop_speed, approach_speed_cap)
             reason = "APPROACH"
+
+        # ── [전환점 감속] 전진↔후진 부호반전 지점 앞에서 near-stop 까지 선형 감속 ──
+        #   급브레이크 이상(한 틱 +→- 반전)으로 차에 무리가 가는 것을 방지. cusp 는
+        #   전/후진 어느 쪽 접근이든 걸린다. min() 이라 정상속도를 낮추기만 한다.
+        cusp_dist = self._dist_to_cusp(cur_dir)
+        if cusp_dist < self.CUSP_SLOWDOWN_DIST:
+            r_cusp = max(0.0, cusp_dist / self.CUSP_SLOWDOWN_DIST)
+            cusp_cap = self.CUSP_MIN_SPEED + (self.CUSP_ENTRY_SPEED - self.CUSP_MIN_SPEED) * r_cusp
+            if cusp_cap < v_target:
+                v_target = cusp_cap
+                reason = "CUSP"
+
+        # ── [후진 저속 캡] direction=-1 구간은 REV_MAX_SPEED 이하로만 (최종 권한) ──
+        if is_rev:
+            v_target = min(v_target, self.REV_MAX_SPEED)
+        v_target = max(self.safe_stop_speed, v_target)
+
+        # ── [신호등 정지] 게이트 정지 유지 중 → 속도 0 + 적분 동결(anti-windup) ──────
+        #   최종 권한(모든 캡 뒤). 이걸로 last_published_speed 가 0 이 되어 초록불 재출발 시
+        #   슬루레이트가 0 부터 부드럽게 올라간다(급출발 방지). spd/cte 적분도 리셋해 오버슛 차단.
+        if gate_held:
+            v_target = 0.0
+            self.spd_integral = 0.0
+            self.cte_integral = 0.0
+            self.d_term_lpf   = 0.0
+            self._was_gate_stopped = True
+            reason = "TL_HOLD"
 
         signed_spd = v_target * cur_dir
 
@@ -1433,11 +2084,22 @@ class DrivingNode(Node):
                 pp_idx = i
                 break
 
-        # 종점 8m 이내: 최종 진행선 위 가상타깃으로 직진 정렬
-        if approach_active and d2dest <= self.FINAL_HEADING_ALIGN_DIST and not is_rev:
-            tgt_lat, tgt_lon = self.final_line_target_latlon(lookahead_m=dynamic_lfd, overshoot_max_m=1.0)
+        # [0714] 종점 근처: waypoint 추종 → 최종 진행선 가상타깃으로 부드럽게 블렌딩.
+        #   기존엔 d2dest<=FINAL_HEADING_ALIGN_DIST에서 if/else로 즉시 전환 → 목표점이
+        #   한 틱만에 바뀌어 조향이 순간 급반전(실측: raw_steer -8.9°→+11.0° 한 틱).
+        #   FINAL_BLEND_BAND 구간에서 두 타깃을 선형보간해 전환을 연속으로 만든다.
+        pp_wp = self.waypoints[pp_idx]
+        blend_start = self.FINAL_HEADING_ALIGN_DIST + self.FINAL_BLEND_BAND
+        if approach_active and d2dest <= blend_start and not is_rev:
+            tgt_lat_f, tgt_lon_f = self.final_line_target_latlon(lookahead_m=dynamic_lfd, overshoot_max_m=1.0)
+            if d2dest <= self.FINAL_HEADING_ALIGN_DIST:
+                tgt_lat, tgt_lon = tgt_lat_f, tgt_lon_f
+            else:
+                # blend: 1.0(waypoint 전량) → 0.0(최종타깃 전량)
+                blend = (d2dest - self.FINAL_HEADING_ALIGN_DIST) / self.FINAL_BLEND_BAND
+                tgt_lat = pp_wp['lat'] * blend + tgt_lat_f * (1.0 - blend)
+                tgt_lon = pp_wp['lon'] * blend + tgt_lon_f * (1.0 - blend)
         else:
-            pp_wp = self.waypoints[pp_idx]
             tgt_lat, tgt_lon = pp_wp['lat'], pp_wp['lon']
 
         dx = math.radians(tgt_lon-self.ctrl_lon)*math.cos(math.radians(self.ctrl_lat))*R   # [v6.7] 예측좌표
@@ -1498,31 +2160,51 @@ class DrivingNode(Node):
 
         p_term = curr_kp * cte_ctrl                 # [v6.5] 지연보상된 CTE로 P 제어(위상 앞섬→왕복↓)
         i_term = curr_ki * self.cte_integral
-        d_term = curr_kd * self.d_term_lpf * 0.20   # [v6.5] 수치 D는 백업으로 축소(lead가 주 감쇠)
+        d_term = curr_kd * self.d_term_lpf * self.D_TERM_SCALE   # [0714] 0.20→D_TERM_SCALE(현재 0.50), 실제 수렴 검증 중
         pid_steer = max(-self.PID_STEER_LIMIT, min(self.PID_STEER_LIMIT, p_term + i_term + d_term))
 
         raw_steer = pp_steer + pid_steer
 
         # ─────────────────────────────────────────────────────────────────
         # 제어 3. 직선 잔떨림 억제 (속도는 이미 곡률에만 반응 → 여기선 조향만)
+        # [0714] |cte_lead| 게이트 추가: 로스백(15_46_49) 실측 — 중심 통과 중(t=9.4~10.1)
+        #   |cte|<0.08 조건에 걸려 raw_steer가 반복 0으로 억제됐는데, 그 순간 헤딩이
+        #   ~2° 어긋난 채 횡이동 중이었음 → 무보정 통과 → 직후 -0.36m 깊은 이탈의 씨앗.
+        #   헤딩 어긋남은 노이즈가 아니라 실제 오차이므로, lead(헤딩오차 반영분)가
+        #   JITTER_LEAD_M 이상이면 억제하지 않는다(정렬 보정은 중심에서도 계속 작동).
         # ─────────────────────────────────────────────────────────────────
         if (is_straight and not approach_active and cte_abs < self.JITTER_CTE_M
-                and abs(raw_steer) < self.JITTER_STEER_DEG):
+                and abs(raw_steer) < self.JITTER_STEER_DEG
+                and abs(cte_lead) < self.JITTER_LEAD_M):
             if abs(raw_steer) < self.JITTER_ZERO_DEG:
                 raw_steer = 0.0
             else:
                 raw_steer = math.copysign((abs(raw_steer) - 0.35) * 0.72, raw_steer)
+
+        # ─────────────────────────────────────────────────────────────────
+        # [0713→0714] 직선 CTE-비례 조향 상한 실험 — 제거됨.
+        #   1차(방향 무관 클램프): steady std 0.113→0.197 악화.
+        #   2차(수렴방향만, cte*d_cte<0): 0.169로 개선했으나 여전히 클램프 자체가
+        #   없는 baseline(0.113, LEAD=1.2+Ki원본)보다 못함 → 이 방향의 레버는
+        #   이 시스템에 안 맞는다고 판단, 제거하고 baseline으로 원복.
+        # ─────────────────────────────────────────────────────────────────
 
         raw_steer = max(-self.STEER_MAX_DEG - 4.0, min(self.STEER_MAX_DEG + 4.0, raw_steer))
 
         # ─────────────────────────────────────────────────────────────────
         # 제어 4. 조향 슬루레이트 + 클램프
         # ─────────────────────────────────────────────────────────────────
-        speed_ratio = max(0.0, min(1.0, (v_now - self.min_speed_ms) / max(1e-6, self.max_speed_ms - self.min_speed_ms)))
+        # [2026-07-29] 정규화 기준을 max_speed_ms → 고정 기준범위로 변경(상한 변경과 분리).
+        speed_ratio = max(0.0, min(1.0, (v_now - self.STEER_RATIO_REF_MIN) /
+                                        max(1e-6, self.STEER_RATIO_REF_MAX - self.STEER_RATIO_REF_MIN)))
         smoothed = raw_steer * self.STEER_SMOOTH_ALPHA + self.prev_steer * (1.0 - self.STEER_SMOOTH_ALPHA)
-        step_limit = self.STEER_STEP_LOW_DEG + (self.STEER_STEP_HIGH_DEG - self.STEER_STEP_LOW_DEG) * speed_ratio
+        if is_straight and not approach_active:
+            # [0713] 직선 판정 시 좌우 반전 속도 자체를 둔화 — S자 반복 억제.
+            step_limit = self.STEER_STEP_STRAIGHT_DEG
+        else:
+            step_limit = self.STEER_STEP_LOW_DEG + (self.STEER_STEP_HIGH_DEG - self.STEER_STEP_LOW_DEG) * speed_ratio
         if cte_abs > 0.55 or abs(raw_steer) > 12.0:
-            step_limit = max(step_limit, self.STEER_STEP_RECOVER_DEG)
+            step_limit = max(step_limit, self.STEER_STEP_RECOVER_DEG)   # 큰 오차 회복은 그대로 빠르게 허용
         delta = smoothed - self.prev_steer
         if delta > step_limit:
             smoothed = self.prev_steer + step_limit
@@ -1557,6 +2239,10 @@ class DrivingNode(Node):
             (far_dist if far_dist != float('inf') else 99.0), far_demand_deg, p_term, i_term, d_term,
             self.d_term_lpf, loop_dt, 1.0 if is_rev else 0.0, near_peak_deg, 1.0 if approach_active else 0.0,
             SPD_REASON_CODE.get(reason, -1), far_peak_deg,   # [v6.7.3] 23=near피크, 26=far피크
+            # [카메라 융합 Phase1 섀도] 27~31. CAM_LAT_ENABLE 과 무관하게 항상 기록된다.
+            #   검증법: RTK 정상 구간에서 cte(3) 와 cam_lat_err(27) 를 겹쳐 봐라 — 일치해야 한다.
+            self._cam_lat_err, 1.0 if self._cam_lat_ok else 0.0,
+            self.cam_cte_now, self._cam_cte_map, self.cam_lat_bias,
         ])
 
         # 상태(1Hz)
@@ -1571,9 +2257,16 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.instant_stop()
+        # Ctrl+C 경합으로 context 가 이미 무효화된 뒤 들어올 수 있다(다중 노드 동시
+        # 종료). instant_stop() 자체는 실주행 긴급정지에도 쓰이므로 안 건드리고,
+        # 여기 종료경로에서만 실패를 흡수해 트레이스백이 새지 않게 한다.
+        try:
+            node.instant_stop()
+        except Exception:
+            pass
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
