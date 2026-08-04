@@ -26,10 +26,11 @@ one_launch.py ― ★자율주행 노드 계층★ launch 파일 (kasa A/B 2보�
 ║  하드웨어 토픽 계약 (nxde arduino 노드와 맞물리는 부분)                        ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  발행  /cmd_vel_raw (Twist)  linear.x = ★주행 목표펄스 0~15 (m/s 가 아니다)★   ║
-║                              angular.z = 조향각 −40~40 (white 부호: +좌/−우)  ║
+║                              angular.z = 조향각 −40~40 (★− 좌 / + 우★)         ║
 ║        /control_state (Bool) True = 구동 허용 / False = 정지                  ║
+║        (/brake_level 은 발행하지 않는다 — 브레이크는 arduino 가 상황별로 결정)  ║
 ║  구독  /encoder (Int32)              A보드 좌+우 펄스의 합 → 속도 피드백        ║
-║        /steer_angle_measured (Int32) B보드 실측 조향각 (white 부호)            ║
+║        /steer_angle_measured (Int32) B보드 실측 조향각 (− 좌 / + 우)           ║
 ║        /vehicle_mode (Bool)          B보드 D5 : True 자율 / False 수동조종     ║
 ║        /throttle_pedal (Int32)       A보드 A0 쓰로틀 페달 raw                 ║
 ║        /drive_pulse_cmd (Int32)      A보드로 실제 나간 주행 목표펄스           ║

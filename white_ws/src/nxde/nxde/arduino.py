@@ -8,10 +8,11 @@
 #
 # ★ 역할 ★
 #   ROS → 보드 :  /cmd_vel_raw (Twist)    linear.x = 주행 목표펄스 0~15
-#                                          angular.z = 조향각 -40~40 (★white 부호: +좌/-우★)
+#                                          angular.z = 조향각 -40~40 (★− 좌 / + 우★)
 #                 /control_state (Bool)   True = 구동 허용 / False = 정지
+#                 /brake_level (Int32)    브레이크 단계 0 / 1 / 2 (선택 — 안 오면 0)
 #   보드 → ROS :  /encoder (Int32)              A보드 좌+우 펄스의 ★합★
-#                 /steer_angle_measured (Int32) B보드 실측 조향각 (white 부호로 변환)
+#                 /steer_angle_measured (Int32) B보드 실측 조향각 (− 좌 / + 우, 그대로 중계)
 #                 /vehicle_mode (Bool)          B보드 D5 : True = 자율 / False = 수동조종
 #                 /throttle_pedal (Int32)       A보드 A0 쓰로틀 페달 raw 0~1023
 #                 /drive_pulse_cmd (Int32)      ★A보드로 실제 보낸 주행 목표펄스★
@@ -31,11 +32,20 @@
 #     한다. 그래야 이 노드가 차량 제원(타이어·PPR)을 몰라도 되고, 제원이 바뀌어도
 #     이 파일을 안 고친다.
 #
-#  2) 조향 부호가 white 와 kasa 에서 반대다.
-#       white  : + = 좌회전   (driving.py 의 STEER_PLANT_GAIN_R 은 steer_deg<0 에 적용)
-#       kasa B : + = 우회전   (kasa_0804_B.ino angleToPot: -40 → RAW_LEFT_LIMIT 쪽)
-#     그래서 steer_invert=True(기본)면 보드로 보낼 때와 실측각을 발행할 때 둘 다 부호를
-#     뒤집는다. → ROS 안에서는 항상 white 부호(+좌), 시리얼선 위에서는 항상 kasa 부호(+우).
+#  2) ★조향 부호는 ROS 와 보드가 같다 (− 좌 / + 우) → 이 노드는 뒤집지 않는다★
+#     [2026-08-04 개정] 예전에는 "ROS 안은 white 부호(+좌), 여기서 반전"이었다. 그런데
+#     GUI 의 가로 조향 레버는 왼쪽 끝이 −40 인데 +가 좌회전이면 **레버 방향과 바퀴 방향이
+#     반대**가 된다(nxde master 실차 시험에서 확인). 그래서 ROS 토픽 전체를 kasa B보드
+#     부호로 통일했다 — 화면·토픽·시리얼·펌웨어가 전부 같은 부호를 쓴다.
+#       kasa B보드 : − 좌 / + 우 (kasa_0804_B.ino angleToPot: −40 → RAW_LEFT_LIMIT(576))
+#     → steer_invert 기본값은 **False**. 배선/펌웨어를 뒤집었을 때만 True 로 쓴다.
+#     ※ driving.py 제어기 내부는 여전히 '+좌'로 튜닝되어 있고, 그 반전은
+#       driving.publish_cmd 의 to_ros_steer() 한 줄에서만 일어난다(거기서 이미 끝났다).
+#
+#  2-1) 브레이크 단계는 /brake_level (Int32) 로 받는다.
+#     Twist 에는 브레이크 필드가 없어 별 토픽을 쓴다. 값은 ★0 / 1 / 2 단계★ 이며
+#     0~255 PWM 이 아니다(kasa_0804_B.ino). 안 오면 0(놓음)으로 둔다.
+#     자율주행 경로에서만 반영된다 — E-stop 과 수동조종에서는 아래 상태판단이 우선한다.
 #
 #  3) /encoder 는 좌·우 펄스의 **합**이다 (평균이 아니다).
 #     합/평균은 어차피 상수배 차이이고, 소비측(white)에서 TICKS_PER_REV 를 2배(192)로
@@ -249,8 +259,10 @@ class Arduino(Node):
 
         # ── 파라미터 ──
         self.baud = int(self.declare_parameter('baud', BAUD_RATE).value)
-        # 조향 부호 반전: white(+좌) ↔ kasa B보드(+우). 배선/펌웨어를 바꿨다면 False.
-        self.steer_invert = bool(self.declare_parameter('steer_invert', True).value)
+        # ★ 조향 부호 반전 — 기본 False(반전 없음) ★ ROS 토픽과 B보드가 같은 규약
+        #   (− 좌 / + 우)을 쓴다. 배선이나 펌웨어를 뒤집었을 때만 True 로 둔다.
+        #   자세한 경위는 파일 헤더 규약 2) 참고.
+        self.steer_invert = bool(self.declare_parameter('steer_invert', False).value)
         # /control_state=False 일 때 걸 브레이크 단계.
         #   0 = 코스트(white/motor.py 의 'S,0' 과 같은 동작, 기본)
         #   1 = 약한 브레이킹으로 더 빨리 세우고 싶을 때
@@ -292,7 +304,7 @@ class Arduino(Node):
         # ── 보드 → ROS 최신 상태 (STOP·형식오류 시 마지막 값 유지) ──
         self.pulse_l = 0
         self.pulse_r = 0
-        self.angle_kasa = 0        # B보드 부호 그대로(+우). 발행 시 white 부호로 변환한다
+        self.angle_board = 0       # B보드 실측 조향각 (− 좌 / + 우 = ROS 규약과 동일)
         self.throttle_raw = 0
         # B보드 D5 주행모드. ★페일세이프로 수동(False)에서 시작한다★ — 첫 텔레메트리를
         # 받기 전에 '자율'로 오인해 자동 명령이 나가는 것보다 수동으로 보는 편이 안전하다.
@@ -301,8 +313,9 @@ class Arduino(Node):
 
         # ── ROS → 보드 명령 캐시 ──
         self.cmd_pulse = 0         # /cmd_vel_raw linear.x (펄스, 0~15)
-        self.cmd_angle = 0         # /cmd_vel_raw angular.z (white 부호 +좌, -40~40)
+        self.cmd_angle = 0         # /cmd_vel_raw angular.z (− 좌 / + 우, -40~40)
         self.control_enabled = False   # /control_state. 시작은 False(정지)
+        self.cmd_brake = 0         # /brake_level (0/1/2). 안 오면 0(놓음)
 
         # ── 수동조종 브레이크 래치 ──
         # ★ 시작값은 0(브레이크 없음)이다 ★ 노드가 뜨는 순간 auto_mode 는 페일세이프로
@@ -335,6 +348,9 @@ class Arduino(Node):
         # ── 서브스크라이버 ──
         self.create_subscription(Twist, '/cmd_vel_raw', self.cb_cmd_vel, 10)
         self.create_subscription(Bool, '/control_state', self.cb_control_state, 10)
+        # 브레이크 단계(0/1/2). Twist 에 필드가 없어 별 토픽으로 받는다. 선택 입력 —
+        # 아무도 발행하지 않으면 0(놓음)으로 유지된다(white 의 driving 은 발행하지 않는다).
+        self.create_subscription(Int32, '/brake_level', self.cb_brake_level, 10)
 
         # ★ 포트를 열기 전에 부모 감시를 걸어둔다 ★
         #   탐색 스레드가 포트를 여는 도중에 런치가 내려가면 이 프로세스가 고아로 남아
@@ -460,9 +476,10 @@ class Arduino(Node):
     #  ROS 콜백
     # ═══════════════════════════════════════════════════════════════
     def cb_cmd_vel(self, msg: Twist):
-        """/cmd_vel_raw — linear.x = 주행 목표펄스(0~15), angular.z = 조향각(white 부호).
+        """/cmd_vel_raw — linear.x = 주행 목표펄스(0~15), angular.z = 조향각(− 좌 / + 우).
 
         ★ linear.x 는 m/s 가 아니다 ★ 환산은 white/kasa_units.py 가 발행 전에 끝낸다.
+        ★ angular.z 부호는 이미 보드 규약과 같다 ★ 여기서 뒤집지 않는다(헤더 규약 2).
         후진은 없으므로 음수는 0 으로 클램프한다(A보드가 음수를 받지 않는다)."""
         pulse = _round_half_away(float(msg.linear.x))
         self.cmd_pulse = max(PULSE_MIN, min(PULSE_MAX, pulse))
@@ -476,6 +493,22 @@ class Arduino(Node):
             self.get_logger().info(
                 f"/control_state → {'구동 허용' if new_state else '정지'}")
         self.control_enabled = new_state
+
+    def cb_brake_level(self, msg: Int32):
+        """/brake_level — 브레이크 ★단계 0/1/2★ (0~255 PWM 이 아니다).
+
+        범위 밖 값은 무시한다. B보드도 범위 밖이면 브레이크 필드만 버리지만, 여기서
+        먼저 걸러 '왜 안 걸리는지' 로그로 드러나게 한다."""
+        level = int(msg.data)
+        if not (0 <= level <= BRAKE_LEVEL_MAX):
+            self.get_logger().warn(
+                f"/brake_level={level} 은 허용범위(0~{BRAKE_LEVEL_MAX}) 밖 — 무시. "
+                f"★0~255 PWM 이 아니라 단계값이다★ (0 놓음 / 1 약 / 2 풀)",
+                throttle_duration_sec=5.0)
+            return
+        if level != self.cmd_brake:
+            self.get_logger().info(f"/brake_level → {level}단")
+        self.cmd_brake = level
 
     # ═══════════════════════════════════════════════════════════════
     #  ROS → 보드 : 명령 조립 + 전송
@@ -493,9 +526,12 @@ class Arduino(Node):
         return max(0, min(PULSE_MAX,
                           _round_half_away(frac * self.manual_pulse_max)))
 
-    def to_kasa_angle(self, white_deg):
-        """white 부호(+좌) → kasa B보드 부호(+우). 규약 2 참고."""
-        deg = -white_deg if self.steer_invert else white_deg
+    def to_board_angle(self, ros_deg):
+        """ROS 조향각 → B보드로 보낼 값. ★기본은 그대로 통과다★ (같은 규약 − 좌 / + 우)
+
+        steer_invert=True 일 때만 뒤집는다 — 배선이나 펌웨어를 바꿔 방향이 반대가 된
+        경우의 탈출구다. 규약 2 참고."""
+        deg = -ros_deg if self.steer_invert else ros_deg
         return max(-STEER_DEG_MAX, min(STEER_DEG_MAX, int(deg)))
 
     def compose(self):
@@ -536,12 +572,16 @@ class Arduino(Node):
         self._prev_auto_mode = True
 
         # (3) ROS 가 정지를 지시한 상태. 조향각은 마지막 값을 유지한다(정면 급조향 방지).
+        #     브레이크는 stop_brake_level 이 /brake_level 보다 우선한다 — '정지 지시'가
+        #     더 강한 의도이므로, 그때 0 을 받고 있었다고 브레이크를 풀면 안 된다.
         if not self.control_enabled:
-            brake = max(0, min(BRAKE_LEVEL_MAX, self.stop_brake_level))
-            return '0', f'{self.to_kasa_angle(self.cmd_angle)},{brake}'
+            brake = max(self.stop_brake_level, self.cmd_brake)
+            brake = max(0, min(BRAKE_LEVEL_MAX, brake))
+            return '0', f'{self.to_board_angle(self.cmd_angle)},{brake}'
 
-        # (4) 정상 자율주행
-        return str(self.cmd_pulse), f'{self.to_kasa_angle(self.cmd_angle)},0'
+        # (4) 정상 자율주행 — /brake_level 을 그대로 반영(안 오면 0)
+        brake = max(0, min(BRAKE_LEVEL_MAX, self.cmd_brake))
+        return str(self.cmd_pulse), f'{self.to_board_angle(self.cmd_angle)},{brake}'
 
     def on_tx_timer(self):
         """값이 바뀌었거나 KEEPALIVE_S 가 지났을 때만 실제로 시리얼에 쓴다.
@@ -655,7 +695,8 @@ class Arduino(Node):
             pass
 
     def parse_b(self, text):
-        """"P,<조향각>,<모드>" (kasa_0804_B.ino). 조향각은 ★kasa 부호(+우)★ 다.
+        """"P,<조향각>,<모드>" (kasa_0804_B.ino). 조향각 부호는 ★− 좌 / + 우★ 로
+           ROS 규약과 같다(그대로 발행한다).
            STOP/형식오류 시 마지막 값 유지. 모드 필드가 없는 구버전(2필드)도 받아준다."""
         if not text.startswith('P,'):
             return
@@ -663,7 +704,7 @@ class Arduino(Node):
         if len(fields) not in (2, 3):
             return
         try:
-            self.angle_kasa = int(fields[1])
+            self.angle_board = int(fields[1])
             if len(fields) == 3:
                 new_mode = bool(int(fields[2]))
                 if new_mode != self.auto_mode:
@@ -694,9 +735,10 @@ class Arduino(Node):
         enc.data = max(0, int(self.pulse_l) + int(self.pulse_r))
         self.pub_encoder.publish(enc)
 
-        # 실측 조향각은 ROS 안에서 white 부호(+좌)로 통일해 내보낸다
+        # 실측 조향각. ★기본은 보드 값 그대로★ (ROS 와 보드가 같은 규약 − 좌 / + 우)
+        #   steer_invert=True 일 때만 뒤집어, 명령과 실측이 항상 같은 부호로 보이게 한다.
         ang = Int32()
-        ang.data = -int(self.angle_kasa) if self.steer_invert else int(self.angle_kasa)
+        ang.data = -int(self.angle_board) if self.steer_invert else int(self.angle_board)
         self.pub_steer_angle.publish(ang)
 
         self.pub_mode.publish(Bool(data=bool(self.auto_mode)))

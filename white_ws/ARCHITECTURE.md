@@ -18,7 +18,8 @@
 > | 수집/주행 모드 강제 | 없음 | **prompt 가 강제** — 수집=수동조종만, 주행=자율주행만 |
 > | 아두이노 대수 | 1대 (`C,틱,조향` / `E,틱`) | **2대** (A=인휠, B=조향·제동) |
 > | `/cmd_vel_raw` linear.x | 목표속도 **m/s** | **주행 목표펄스 0~15** |
-> | `/cmd_vel_raw` angular.z | 조향각 deg (±21) | 조향각 deg (**±40**), 부호는 그대로 +좌 |
+> | `/cmd_vel_raw` angular.z | 조향각 deg (±21), `+`=좌 | 조향각 deg (**±40**), **`−`=좌 / `+`=우** (kasa 규약으로 통일) |
+> | 브레이크 명령 | 없음 | **`/brake_level` (Int32) 단계 0/1/2** — Twist 에 필드가 없어 별 토픽 |
 > | `/encoder` | 부호 있는 틱/10ms (1틱=0.283m/s) | **부호 없는 좌+우 합/20ms** (1카운트=0.442m/s) |
 > | 후진 | 지원 (`direction=-1` WP) | **없음** (수동조종으로만) |
 > | 브레이크 | 없음 | 리니어 **단계 0/1/2** (arduino 노드가 관리) |
@@ -97,13 +98,18 @@ ros2 run white prompt
 
 - **`/ego_state`** (Float64MultiArray, 20Hz) = `[lat, lon, x, y, heading°, speed_m/s, 0, pitch°, terrain_code]`
   — driving/mapping은 **lat/lon(절대 위경도)과 heading, speed만 사용**. x/y는 gps_imu 내부 원점 기준 로컬 좌표(디버그용).
-- **`/cmd_vel_raw`** (Twist) = `linear.x`: **주행 목표펄스 0~15 (★m/s 가 아니다★)**, `angular.z`: 조향각 deg (±40, **+좌/−우**).
+- **`/cmd_vel_raw`** (Twist) = `linear.x`: **주행 목표펄스 0~15 (★m/s 가 아니다★)**, `angular.z`: 조향각 deg (±40, **★− 좌 / + 우★**).
   - m/s → 펄스 환산(`kasa_units.ms_to_pulse`)은 **`/cmd_vel_raw` 를 실제로 발행하는 노드**가 한다:
     `use_camera=false` → `driving.publish_cmd`, `use_camera=true` → `camera_judgment.cb_cmd`.
   - **`/cmd_vel_drive`** (게이트 입력)는 계속 **m/s** 다 — camera_judgment 의 정지·서행 판정이
     `v=√(2·a·d)` 같은 물리식이라 펄스로는 성립하지 않는다. 즉 **단위 경계는 게이트의 출력단**이다.
-  - 조향 부호는 ROS 안에서 항상 white 규약(+좌)이다. kasa B보드 규약(+우)으로의 반전은
-    `nxde/arduino.py` 가 시리얼 전송 직전에만 한다(`steer_invert` 파라미터).
+  - **조향 부호는 ROS·시리얼·펌웨어·GUI 가 모두 `− 좌 / + 우` 로 같다** (2026-08-04 통일).
+    유일한 예외는 `driving.py` 제어기 **내부**(`+`=좌, 튜닝값 의미 보존)이고, 그 반전은
+    **`driving.publish_cmd` 의 `ku.to_ros_steer()` 한 줄에서만** 일어난다.
+    `nxde/arduino.py` 의 `steer_invert` 기본값은 `false` 다 — 거기서 또 뒤집으면 이중 반전.
+- **`/brake_level`** (Int32) = 브레이크 **단계 0 / 1 / 2** (★0~255 PWM 이 아니다★).
+  Twist 에 브레이크 필드가 없어 별 토픽. 선택 입력이고 white 의 판단 노드는 발행하지 않는다
+  (브레이크는 `nxde/arduino.py` 가 E-stop·수동조종·정지지시 상황별로 결정). `nxde master` 가 발행한다.
 - **`/encoder`** (Int32, 20Hz) = A보드 **좌+우 펄스의 합**, 부호 없음, 20ms 창.
   1카운트 = 0.442 m/s. 환산 상수는 `white/kasa_units.py` 단일 소유(이전엔 driving/gps_imu/
   sensor_monitor 세 곳이 각자 하드코딩했다).

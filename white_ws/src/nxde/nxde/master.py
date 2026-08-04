@@ -21,10 +21,31 @@
 #     (1) 컨트롤러(조이스틱) 모드 제거 — 무선 컨트롤러를 더 이상 쓰지 않는다.
 #         수동조종은 차량의 D5 스위치 + 실제 페달·핸들이다.
 #     (2) 통신 양식이 white 규약 토픽으로 바뀜 — /in·/out String 대신
-#         /cmd_vel_raw(Twist) + /control_state(Bool) 발행, 텔레메트리는 개별 토픽 구독.
+#         /cmd_vel_raw(Twist) + /control_state(Bool) + /brake_level(Int32) 발행,
+#         텔레메트리는 개별 토픽 구독.
 #     (3) 디퍼렌셜·PWM모드 체크박스 제거 — nxde/arduino.py 가 A보드로 항상 '단일값'만
 #         보내기 때문이다(직접 PWM 16~255 는 PID·슬루레이트·폭주감지가 전부 빠지는
 #         무보호 경로라 자율주행 스택에서 봉쇄했다). 좌우 차동도 하지 않는다.
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+#  [2026-08-04 수정] 실차 시험에서 드러난 구버전 잔재 2건
+# ═══════════════════════════════════════════════════════════════════════════════
+#   ★① 브레이크 : 0~100 슬라이더(표시 전용) → 0/1/2 단계(실제 제어) ★
+#     kasa_ws 판을 옮길 때 브레이크 레버를 0~100 표시 전용으로 두었다. 그건 B보드가
+#     0~255 열린루프 브레이크만 지원하던 0731 이전 시절의 잔재다. 지금 펌웨어
+#     (kasa_0804_B.ino)는 ★단계 0/1/2★ 를 받고 엔코더 실측 시간표로 정확히 밟는다:
+#         0 = 기본위치(놓음) / 1 = 행정의 1/3 (83카운트) / 2 = 풀브레이킹 (250카운트)
+#     Twist 에는 브레이크 필드가 없으므로 /brake_level (Int32) 로 따로 발행한다.
+#     → 이제 레버가 실제로 브레이크를 밟는다.
+#
+#   ★② 조향 부호 : 레버 방향과 바퀴 방향이 반대였다 ★
+#     가로 조향 레버는 왼쪽 끝이 −40, 오른쪽 끝이 +40 이다(당연한 배치). 그런데 예전
+#     규약은 ROS 안에서 '+ = 좌회전'(white 부호)이었다 → 레버를 오른쪽으로 밀면 차가
+#     왼쪽으로 갔다. 그래서 ROS 토픽 전체를 kasa B보드 부호로 통일했다:
+#         ★ 음수 = 좌회전 / 양수 = 우회전 ★  (화면·토픽·시리얼·펌웨어 전부 동일)
+#     이 파일은 레버값을 그대로 발행한다 — 부호를 만지는 곳이 없다.
+#     (driving.py 제어기 내부만 여전히 '+좌'이고, 그 반전은 driving.publish_cmd 의
+#      to_ros_steer() 한 줄에서 끝난다. arduino.py 의 steer_invert 는 기본 False.)
 #
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ⚠️⚠️ one_launch.py / prompt 와 동시에 쓰지 말 것 ⚠️⚠️
@@ -44,7 +65,8 @@
 #
 # ── 레버 조작 ──
 #   마우스로 레버를 눌러 끌면 그 위치의 값이 되고, 손을 떼도 유지된다(Windows 볼륨
-#   슬라이더와 같은 느낌 — 원점 복귀 없음). 키보드 Up/Down=엑셀, Left/Right=조향.
+#   슬라이더와 같은 느낌 — 원점 복귀 없음). 키보드 Up/Down=엑셀, Left/Right=조향,
+#   PageUp/PageDown=브레이크 단계.
 #   ★수동조종 모드에서는 레버가 잠기고 '실측값을 비추는 계기판'이 된다★
 #
 # ── 발행 ON/OFF 토글 (자율주행 모드 전용) ──
@@ -55,11 +77,14 @@
 #     없어서 발행을 끊으면 arduino 노드가 마지막 값을 1초마다 재전송한다(= 차가 계속 간다).
 #     그래서 OFF 동안에도 정지값을 계속 내보내는 편이 안전하다.
 #
-# ── 브레이크 레버 ──
-#   0~100 표시용으로만 존재한다. /cmd_vel_raw(Twist)에는 브레이크 필드가 없고, 브레이크
-#   단계(0/1/2)는 nxde/arduino.py 가 상황에 따라 스스로 정한다(E-stop 2단, 수동조종 진입
-#   2단→페달 밟으면 0단, /control_state=False 시 stop_brake_level). kasa_ws 판에서도
-#   이 슬라이더는 표시 전용이었다(항상 0 을 보냈다).
+# ── 브레이크 레버 (0 / 1 / 2 단계, 실제 제어) ──
+#   /brake_level (Int32) 로 발행한다. 자율주행 모드에서만 반영되며, 아래가 우선한다:
+#     · E-stop     → B보드가 스스로 2단 체결 / 해제 시 0단 복귀 (ROS 개입 없음)
+#     · 수동조종    → arduino.py 의 래치 (진입 2단 → 페달 밟으면 0단)
+#     · /control_state=False → max(stop_brake_level, 이 레버값)
+#   즉 이 레버가 실제로 브레이크를 움직이는 것은 '자율주행 + 발행 ON' 일 때다.
+#   ★1단은 행정의 1/3, 2단은 풀브레이킹이다 — 정차 중에 2단을 걸면 리니어가 페달을
+#     끝까지 밟으므로, 시험 시에는 1단부터 확인하는 것이 안전하다★
 #
 # ── 자율주행 / 수동조종 모드 (B보드 D5 스위치) ──
 #   /vehicle_mode 를 그대로 따른다 (이 창에서 모드를 바꾸는 수단은 없다 — 물리 스위치가
@@ -96,7 +121,10 @@ PULSE_MAX = 15          # A보드 단일값 입력 상한
 STEER_MAX = 40          # B보드 STEER_ANGLE_MAX
 ADC_MAX   = 1023
 
-BRAKE_UI_MAX = 100      # 브레이크 레버 표시 범위(0~100). 실제 전송과 무관(표시 전용).
+BRAKE_LEVEL_MAX = 2     # ★브레이크 단계 0/1/2★ (kasa_0804_B.ino — 0~255 PWM 이 아니다)
+#   0 = 기본위치(놓음) / 1 = 행정의 1/3 (83카운트) / 2 = 풀브레이킹 (250카운트)
+BRAKE_LABELS = {0: "놓음", 1: "약(1/3)", 2: "풀"}
+KEYBOARD_BRAKE_STEP = 1     # PageUp/PageDown 1회당 브레이크 단계 증감
 
 # 실차 실측 (kasa_ws master.py / PULSE_SPEED.md 와 동일)
 KMH_PER_PULSE = 3.18    # 1펄스 = 3.18 km/h → 15펄스 = 47.7 km/h
@@ -151,6 +179,8 @@ class MasterNode(Node):
 
         self.pub_cmd = self.create_publisher(Twist, '/cmd_vel_raw', 10)
         self.pub_state = self.create_publisher(Bool, '/control_state', 10)
+        # 브레이크 단계(0/1/2). Twist 에 필드가 없어 별 토픽으로 보낸다.
+        self.pub_brake = self.create_publisher(Int32, '/brake_level', 10)
 
         self.create_subscription(Int32, '/encoder', self._cb_encoder, 10)
         self.create_subscription(Int32, '/steer_angle_measured', self._cb_steer, 10)
@@ -162,7 +192,7 @@ class MasterNode(Node):
 
         # ── 텔레메트리 캐시 ──
         self.wheel_pulse = 0        # /encoder (좌+우 합)
-        self.steer_measured = 0     # /steer_angle_measured (white 부호 +좌)
+        self.steer_measured = 0     # /steer_angle_measured (− 좌 / + 우, 명령과 같은 부호)
         self.drive_pulse_cmd = 0    # /drive_pulse_cmd (자율=계획값 / 수동=페달 환산값)
         self.throttle_raw = 0       # /throttle_pedal (A0 raw)
         # B보드 D5 주행모드. None = /vehicle_mode 를 아직 못 받아 모름.
@@ -186,21 +216,27 @@ class MasterNode(Node):
         self.auto_mode = bool(msg.data)
 
     # ---------- 발행 ----------
-    def publish_cmd(self, pulse, angle_deg, enabled):
-        """/cmd_vel_raw + /control_state 발행.
+    def publish_cmd(self, pulse, angle_deg, brake_level, enabled):
+        """/cmd_vel_raw + /control_state + /brake_level 발행.
 
-        linear.x = 주행 목표펄스 0~15 (★m/s 가 아니다★)
-        angular.z = 조향각 -40~40 (★white 부호 +좌★ — kasa 부호 반전은 arduino.py 담당)"""
+        linear.x  = 주행 목표펄스 0~15 (★m/s 가 아니다★)
+        angular.z = 조향각 -40~40 (★− 좌 / + 우 — 레버값을 그대로, 부호를 만지지 않는다★)
+        brake     = 단계 0/1/2 (★0~255 PWM 이 아니다★)"""
         msg = Twist()
         msg.linear.x = float(max(0, min(PULSE_MAX, int(pulse))))
         msg.angular.z = float(max(-STEER_MAX, min(STEER_MAX, int(angle_deg))))
         self.pub_cmd.publish(msg)
         self.pub_state.publish(Bool(data=bool(enabled)))
+        self.pub_brake.publish(
+            Int32(data=int(max(0, min(BRAKE_LEVEL_MAX, int(brake_level))))))
         self.last_angle_cmd = int(msg.angular.z)
 
     def publish_stop(self):
-        """종료 시 정지값. 조향은 마지막 값을 유지한다(정면 급조향 방지)."""
-        self.publish_cmd(0, self.last_angle_cmd, False)
+        """종료 시 정지값. 조향은 마지막 값을 유지한다(정면 급조향 방지).
+
+        ★브레이크는 0(놓음)으로 둔다★ 리니어가 페달을 물고 있으면 사람이 차를 움직일
+        수 없다 — 창을 닫은 뒤 수동으로 빼내야 하는 상황을 만들지 않는다."""
+        self.publish_cmd(0, self.last_angle_cmd, 0, False)
 
     def driving_node_present(self):
         """driving_node 가 떠 있으면 True → /cmd_vel_raw 발행자 충돌."""
@@ -338,12 +374,14 @@ class MasterGui:
 
         brake_col = tk.Frame(levers, bg=BG)
         brake_col.grid(row=0, column=1, padx=10)
-        tk.Label(brake_col, text="브레이크", bg=BG, fg=TEXT,
+        tk.Label(brake_col, text="브레이크 (단계)", bg=BG, fg=TEXT,
                  font=("Consolas", 13, "bold")).pack()
-        self.brake_ui = Slider(brake_col, 'v', 0, BRAKE_UI_MAX, 0)
-        self.brake_ui.pack()
-        tk.Label(brake_col, text="표시 전용\n(단계는 arduino 가 결정)", bg=BG, fg=DISABLED_TEXT,
-                 font=("Consolas", 8), justify='center').pack(pady=(2, 0))
+        # ★0/1/2 단계 — 실제로 리니어를 움직인다★ (구버전의 0~100 표시 전용이 아니다)
+        self.brake = Slider(brake_col, 'v', 0, BRAKE_LEVEL_MAX, 0)
+        self.brake.pack()
+        self.brake_label = tk.Label(brake_col, text="0 놓음", bg=BG, fg=TEXT,
+                                    font=("Consolas", 9))
+        self.brake_label.pack(pady=(2, 0))
 
         mid_col = tk.Frame(levers, bg=BG, width=160)
         mid_col.grid(row=0, column=2, padx=16)
@@ -363,18 +401,25 @@ class MasterGui:
         self.mode_box = tk.Label(steer_col, text="모드 확인 중...", bg=IDLE_COLOR, fg=TEXT,
                                  font=("Consolas", 13, "bold"), width=18, pady=7)
         self.mode_box.pack(pady=(0, 8))
-        tk.Label(steer_col, text="조향 (도, +좌/-우)", bg=BG, fg=TEXT,
+        # ★부호 규약: 왼쪽 끝 −40 = 좌회전 / 오른쪽 끝 +40 = 우회전★
+        #   레버를 미는 방향과 바퀴가 도는 방향이 같다(파일 헤더 ② 참고).
+        tk.Label(steer_col, text="조향 (도, ←−  +→)", bg=BG, fg=TEXT,
                  font=("Consolas", 13, "bold")).pack()
         self.steering = Slider(steer_col, 'h', -STEER_MAX, STEER_MAX, 0)
         self.steering.pack()
+        tk.Label(steer_col, text="− 좌회전   /   + 우회전", bg=BG, fg=DISABLED_TEXT,
+                 font=("Consolas", 8)).pack(pady=(2, 0))
 
         self._build_value_table(root)
         self._build_conn_status(root)
 
         root.bind('<KeyPress-Up>', lambda e: self._kb_nudge('throttle', KEYBOARD_PULSE_STEP))
         root.bind('<KeyPress-Down>', lambda e: self._kb_nudge('throttle', -KEYBOARD_PULSE_STEP))
+        # ← 는 음수(좌회전), → 는 양수(우회전) — 레버 방향과 일치한다
         root.bind('<KeyPress-Left>', lambda e: self._kb_nudge('steering', -KEYBOARD_STEER_STEP))
         root.bind('<KeyPress-Right>', lambda e: self._kb_nudge('steering', KEYBOARD_STEER_STEP))
+        root.bind('<KeyPress-Prior>', lambda e: self._kb_nudge('brake', KEYBOARD_BRAKE_STEP))
+        root.bind('<KeyPress-Next>', lambda e: self._kb_nudge('brake', -KEYBOARD_BRAKE_STEP))
         root.focus_set()
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -399,7 +444,8 @@ class MasterGui:
                      font=("Consolas", 10)).grid(row=1, column=col + 1)
             tk.Label(table, textvariable=self.command_vars[col], bg=BG, fg=OK_COLOR,
                      font=("Consolas", 10)).grid(row=2, column=col + 1)
-        tk.Label(table, text="실측 주행펄스는 좌+우 합(1카운트=1.59km/h), 조향각은 가변저항 실측",
+        tk.Label(table, text="실측 주행펄스는 좌+우 합(1카운트=1.59km/h) · 조향각은 가변저항 실측"
+                             " · 부호 − 좌 / + 우",
                  bg=BG, fg=DISABLED_TEXT, font=("Consolas", 8)).grid(
                      row=3, column=0, columnspan=4, pady=(6, 0))
 
@@ -421,16 +467,20 @@ class MasterGui:
                                bg=OK_COLOR if self.enabled else IDLE_COLOR)
         if not self.enabled:
             # ON→OFF : 레버 위치와 무관하게 즉시 0 으로 되돌리고 정지값을 1회 강제 발행
+            #   ★브레이크도 0 으로 내린다★ 리니어가 페달을 물고 있으면 차를 못 움직인다.
             self.throttle.set_value(0)
             self.steering.set_value(0)
-            self.node.publish_cmd(0, 0, False)
-            self._last_pub = (0, 0, False)
+            self.brake.set_value(0)
+            self.node.publish_cmd(0, 0, 0, False)
+            self._last_pub = (0, 0, 0, False)
             self._last_pub_t = time.monotonic()
 
     def _kb_nudge(self, which, delta):
         if self.manual_active:
             return   # 수동조종 모드에서는 마우스와 마찬가지로 키보드도 무시
-        (self.throttle if which == 'throttle' else self.steering).nudge(delta)
+        {'throttle': self.throttle,
+         'steering': self.steering,
+         'brake':    self.brake}[which].nudge(delta)
 
     # ---------- 상단 안내문구 ----------
     def _update_status_text(self):
@@ -486,33 +536,39 @@ class MasterGui:
             self.toggle_btn.config(text="OFF", bg=IDLE_COLOR)
             self._update_status_text()
 
-        self.throttle.readonly = manual
-        self.steering.readonly = manual
-        handle_color = DISABLED_TEXT if manual else HANDLE_COLOR
-        self.throttle.set_handle_color(handle_color)
-        self.steering.set_handle_color(handle_color)
+        for sl in (self.throttle, self.steering, self.brake):
+            sl.readonly = manual
+            sl.set_handle_color(DISABLED_TEXT if manual else HANDLE_COLOR)
 
         if manual:
             # ── 수동조종 : 레버가 '실측을 비추는 계기판'이 된다 ──
-            #   엑셀 = 페달 환산 목표펄스, 조향 = 가변저항 실측 각도
+            #   엑셀 = 페달 환산 목표펄스, 조향 = 가변저항 실측 각도(같은 부호라 그대로)
+            #   브레이크는 arduino.py 의 래치가 정하므로 이 창은 값을 모른다 → 0 으로 둔다.
             self.throttle.set_value(self.node.drive_pulse_cmd)
             self.steering.set_value(self.node.steer_measured)
+            self.brake.set_value(0)
             pulse_cmd = 0
             angle_cmd = self.node.steer_measured   # 전환 직후 급조향 방지
+            brake_cmd = 0
             enabled = False
         else:
             pulse_cmd = self.throttle.value
             angle_cmd = self.steering.value
+            brake_cmd = self.brake.value
             enabled = self.enabled
             if not enabled:
                 pulse_cmd = 0   # OFF 동안에는 정지값을 계속 내보낸다(헤더 참고)
 
         # ── 발행 : 값이 바뀌었거나 KEEPALIVE_S 가 지났을 때 ──
-        triple = (pulse_cmd, angle_cmd, enabled)
-        if triple != self._last_pub or (now - self._last_pub_t) >= KEEPALIVE_S:
-            self.node.publish_cmd(pulse_cmd, angle_cmd, enabled)
-            self._last_pub = triple
+        state = (pulse_cmd, angle_cmd, brake_cmd, enabled)
+        if state != self._last_pub or (now - self._last_pub_t) >= KEEPALIVE_S:
+            self.node.publish_cmd(pulse_cmd, angle_cmd, brake_cmd, enabled)
+            self._last_pub = state
             self._last_pub_t = now
+
+        self.brake_label.config(
+            text=f"{brake_cmd} {BRAKE_LABELS.get(brake_cmd, '?')}",
+            fg=ESTOP_COLOR if brake_cmd >= BRAKE_LEVEL_MAX else TEXT)
 
         # ── 주행모드 박스 / 페달 표시 ──
         if self.node.auto_mode is None:

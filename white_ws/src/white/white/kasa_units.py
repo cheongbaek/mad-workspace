@@ -50,15 +50,27 @@ sensor_monitor.py 세 곳에 각자 하드코딩되어 있었다. kasa 차량으
    본격적으로 속도를 올릴 때는 실차 로스백으로 그 위 행을 채워야 한다.
 
 ═══════════════════════════════════════════════════════════════════════════════
- 3. 조향 : /cmd_vel_raw angular.z = 조향각(도)
+ 3. 조향 부호 : ★ROS 토픽은 kasa 규약 = 음수 좌회전 / 양수 우회전★
 ═══════════════════════════════════════════════════════════════════════════════
- ★ ROS 내부와 시리얼선 위의 부호 규약이 반대다 ★
-     white(ROS 내부) : + = 좌회전   (driving.py 의 STEER_PLANT_GAIN_R 은 steer_deg<0 에 적용)
-     kasa B보드      : + = 우회전   (kasa_0804_B.ino angleToPot: -40 → RAW_LEFT_LIMIT 쪽)
- 반전은 ★nxde/arduino.py 가 담당한다★ (steer_invert 파라미터, 기본 True).
- 그래서 /cmd_vel_raw 의 angular.z 는 계속 **white 부호(+좌)** 이고, ROS 안의 모든
- 토픽(/steer_angle_measured 포함)이 같은 부호로 통일된다.
- → 이 모듈에는 부호 변환 함수를 두지 않는다. 여기서도 뒤집으면 이중 반전이 된다.
+ ── [2026-08-04 개정] 규약을 뒤집었다 ──
+ 이전 판은 "ROS 안은 white 부호(+좌)로 두고, 시리얼 전송 직전에 arduino.py 가 반전"
+ 이었다. 그런데 그러면 **사람이 보는 화면과 부호가 반대가 된다**:
+   · GUI 의 가로 조향 레버는 왼쪽 끝이 −40, 오른쪽 끝이 +40 이다(당연한 배치).
+   · 그 레버를 오른쪽(+)으로 밀면 white 부호에서는 '좌회전' 명령이 된다.
+   → 실제로 nxde master 로 시험했을 때 레버 방향과 바퀴 방향이 반대로 나왔다.
+ 그래서 **ROS 토픽 전체를 kasa B보드 부호로 통일**한다. 화면·토픽·시리얼·펌웨어가
+ 전부 같은 부호를 쓰므로 더 이상 어디서 뒤집히는지 추적할 필요가 없다.
+
+   ROS 토픽 (/cmd_vel_raw.angular.z, /steer_angle_measured) : ★− 좌 / + 우★
+   kasa B보드 시리얼                                        : − 좌 / + 우  (동일)
+     (kasa_0804_B.ino angleToPot: −40 → RAW_LEFT_LIMIT(576) 쪽 = 왼쪽 끝)
+   → nxde/arduino.py 의 steer_invert 기본값은 **False**(반전 없음)가 되었다.
+
+ ⚠️ 단 하나 예외가 있다 : ★driving.py 의 제어기 내부 계산★
+   순수추종·PID·조향게인(STEER_PLANT_GAIN_L/R)·트림은 전부 **+좌 기준(δ_ctrl)** 으로
+   튜닝되어 있다. 그 수치들의 의미를 보존하기 위해 내부는 그대로 두고,
+   **발행 직전 딱 한 번** to_ros_steer() 로 뒤집는다(driving.publish_cmd).
+   즉 부호가 뒤집히는 지점은 코드 전체에서 그 한 줄뿐이다.
 """
 
 import math
@@ -142,5 +154,23 @@ def pulse_to_ms(pulse: float) -> float:
 
 def clamp_steer_deg(deg: float) -> float:
     """조향각을 B보드 수용 범위(±STEER_MAX_DEG)로 클램프. ★부호는 건드리지 않는다★
-    (white 부호 +좌 유지. kasa 부호로의 반전은 nxde/arduino.py 가 한다)"""
+
+    이미 ROS 규약(− 좌 / + 우)인 값에 쓴다 — 예: camera_judgment 가 driving 의
+    angular.z 를 그대로 통과시킬 때."""
     return max(-float(STEER_MAX_DEG), min(float(STEER_MAX_DEG), float(deg)))
+
+
+def to_ros_steer(ctrl_deg: float) -> float:
+    """★제어기 내부 부호(+좌) → ROS 토픽 부호(− 좌 / + 우)★ 로 변환하고 클램프한다.
+
+    ★★ 코드 전체에서 조향 부호가 뒤집히는 지점은 여기 하나뿐이다 ★★
+    호출처도 하나여야 한다 — driving.publish_cmd 의 msg.angular.z 대입.
+    두 번 호출하면 이중 반전으로 조용히 좌우가 바뀐다.
+
+    왜 driving 내부만 다른 부호를 쓰는가 :
+      순수추종 기하(atan2 기반), PID, STEER_PLANT_GAIN_L/R, STEER_TRIM_DEG 가 모두
+      '+ = 좌회전' 전제로 실측·튜닝된 값이다. 내부를 뒤집으면 그 수치들의 의미가
+      전부 반대가 되어 로스백 분석 기록과 대조할 수 없게 된다.
+      그래서 내부는 보존하고 출력단에서만 규약을 맞춘다. 파일 헤더 3절 참고.
+    """
+    return clamp_steer_deg(-float(ctrl_deg))

@@ -25,7 +25,7 @@ mapping.py ― 경로 수집(매핑) 노드 [자동 리모델링 포함]
      ② wheel_pulse     /encoder               실제로 돈 주행 펄스 (좌+우 합, 20ms 창)
         wheel_speed                           위 값을 m/s 로 환산 (kasa_units, 1카운트=0.442)
      ③ steer_measured  /steer_angle_measured  DC 조향모터 가변저항 실측 각도 [deg]
-                                              (white 부호 +좌/−우 — arduino.py 가 변환해 발행)
+                                              (★− 좌 / + 우★ — B보드 값 그대로)
 
    부수 기록 : throttle_raw(A0 원값) / auto_mode(D5) / estop
      · auto_mode 는 ★수집 중 모드가 바뀌지 않았는지 사후 검증하는 근거★ 다.
@@ -172,8 +172,8 @@ class MappingNode(Node):
         self.direction = 1
 
     def cb_steer_meas(self, msg: Int32):
-        """③ DC 조향모터 가변저항 실측 각도 [deg]. arduino.py 가 white 부호(+좌)로 변환해
-        발행하므로 여기서 부호를 다시 뒤집지 않는다."""
+        """③ DC 조향모터 가변저항 실측 각도 [deg]. ★부호는 − 좌 / + 우★ (ROS 규약).
+        B보드 값 그대로 오므로 여기서 뒤집지 않는다."""
         self.steer_measured = float(msg.data)
 
     def cb_throttle_raw(self, msg: Int32):

@@ -128,22 +128,32 @@ ros2 run nxde master                                                 # 터미널
 `/control_state` 의 발행자가 겹쳐 두 명령이 교대하며 차가 떤다. master 는 `driving_node`
 가 떠 있으면 상단에 주황색 경고를 띄운다.
 
+레버 구성:
+
+| 레버 | 범위 | 키보드 |
+|---|---|---|
+| 엑셀 | 0 ~ 15 펄스 (1펄스 = 3.18 km/h) | `↑` `↓` |
+| **브레이크** | **0 / 1 / 2 단계** (0 놓음 / 1 행정 1/3 / 2 풀) | `PgUp` `PgDn` |
+| 조향 | −40 ~ +40 도 (**왼쪽 끝이 −, 오른쪽 끝이 +**) | `←` `→` |
+
 체크할 것:
 
 | 확인 항목 | 기대 결과 |
 |---|---|
-| 조향 레버를 **왼쪽(음수 아님, `+`쪽)** 으로 | 바퀴가 **왼쪽**으로. 반대면 `steer_invert:=false` |
-| 명령 조향각 ↔ 실측 조향각 | 몇 초 안에 수렴 (B보드 PD 폐루프) |
+| 조향 레버를 **오른쪽(`+`)** 으로 | 바퀴가 **오른쪽**으로 (레버 방향 = 바퀴 방향). 반대면 `steer_invert:=true` |
+| 명령 조향각 ↔ 실측 조향각 | 부호까지 같은 값으로 몇 초 안에 수렴 (B보드 PD 폐루프) |
 | 엑셀 1~3펄스 | 실측 주행펄스(좌+우 합)가 명령의 **약 2배**로 올라온다 |
+| **브레이크 1단** | 리니어가 행정의 1/3(83카운트)까지 밀린다. **2단은 풀브레이킹이라 1단부터 확인** |
 | 수동조종에서 페달 | 엑셀 레버가 따라 올라오고, 브레이크가 풀린다 |
-| E-stop 스위치 | 상단 빨간 경고 + 실측값 정지 |
+| E-stop 스위치 | 상단 빨간 경고 + 실측값 정지 + B보드가 리니어 2단 체결 |
 
 ### 토픽으로 직접 확인 (GUI 없이)
 
 ```bash
 ros2 topic pub /control_state std_msgs/Bool "{data: true}"
 ros2 topic pub -r 10 /cmd_vel_raw geometry_msgs/Twist \
-  "{linear: {x: 1.0}, angular: {z: 10.0}}"         # 1펄스 전진 + 좌조향 10°
+  "{linear: {x: 1.0}, angular: {z: 10.0}}"         # 1펄스 전진 + ★우조향★ 10°
+ros2 topic pub /brake_level std_msgs/Int32 "{data: 1}"   # 브레이크 1단 (약)
 ros2 topic echo /board_status                      # A:1,B:1,ESTOP:0,MODE:1
 ros2 topic echo /encoder
 ```
@@ -156,15 +166,30 @@ ros2 topic echo /encoder
 
 | 토픽 | 타입 | 내용 |
 |---|---|---|
-| `/cmd_vel_raw` | `geometry_msgs/Twist` | `linear.x` = 주행 목표펄스 **0~15 (m/s 아님)**<br>`angular.z` = 조향각 **−40~40, white 부호(+좌/−우)** |
+| `/cmd_vel_raw` | `geometry_msgs/Twist` | `linear.x` = 주행 목표펄스 **0~15 (m/s 아님)**<br>`angular.z` = 조향각 **−40~40, ★− 좌 / + 우★** |
 | `/control_state` | `std_msgs/Bool` | `True` = 구동 허용 / `False` = 정지 |
+| `/brake_level` | `std_msgs/Int32` | 브레이크 **단계 0 / 1 / 2** (★0~255 PWM 아님★). 선택 — 안 오면 0 |
+
+### ★ 조향 부호 규약 (2026-08-04 개정) ★
+
+**ROS 토픽 · 시리얼 · 펌웨어 · GUI 가 모두 같은 부호를 씁니다: 음수 = 좌회전 / 양수 = 우회전.**
+
+이전에는 "ROS 안은 white 부호(`+`=좌), arduino.py 가 반전"이었는데, GUI 의 가로 조향 레버는
+왼쪽 끝이 `−40` 이라 **레버를 오른쪽으로 밀면 차가 왼쪽으로 가는** 문제가 실차 시험에서
+나왔습니다. 그래서 규약을 kasa B보드 기준으로 통일했습니다.
+
+- `arduino.py` 의 `steer_invert` 기본값 = **`false`** (반전 없음)
+- 유일한 예외: `driving.py` 제어기 **내부**는 여전히 `+`=좌 (순수추종·PID·`STEER_PLANT_GAIN_L/R`·
+  `STEER_TRIM_DEG` 가 그 전제로 실측·튜닝된 값이라 의미를 보존). 그 반전은
+  **`driving.publish_cmd` 의 `ku.to_ros_steer()` 한 줄에서만** 일어납니다.
+- 즉 **부호가 뒤집히는 지점은 코드 전체에서 그 한 줄뿐입니다.** 두 번 뒤집으면 조용히 좌우가 바뀝니다.
 
 ### 보드 → ROS
 
 | 토픽 | 타입 | 내용 |
 |---|---|---|
 | `/encoder` | `Int32` | A보드 **좌+우 펄스의 합** (부호 없음, 20ms 창). 1카운트 = 0.442 m/s |
-| `/steer_angle_measured` | `Int32` | B보드 가변저항 실측 조향각. **white 부호로 변환해서** 발행 |
+| `/steer_angle_measured` | `Int32` | B보드 가변저항 실측 조향각 (**− 좌 / + 우**, 그대로 중계) |
 | `/vehicle_mode` | `Bool` | B보드 D5 : `True` 자율주행 / `False` 수동조종 |
 | `/throttle_pedal` | `Int32` | A보드 A0 쓰로틀 페달 raw 0~1023 |
 | `/drive_pulse_cmd` | `Int32` | **A보드로 실제 나간 주행 목표펄스** (자율=계획값 / 수동=페달 환산값) |
@@ -202,8 +227,12 @@ B보드 출력 :  P,<조향각>,<모드>\n         (50ms) / STOP\n (e-stop 중)
 |---|---|---|---|
 | 1 | **E-stop** (`STOP` 수신) | `0` | `x,0` |
 | 2 | **수동조종** (D5 개방) | 페달 환산 펄스 | `x,<2→0>` |
-| 3 | `/control_state=False` | `0` | `<마지막 조향각>,<stop_brake_level>` |
-| 4 | 정상 자율주행 | `<펄스>` | `<조향각>,0` |
+| 3 | `/control_state=False` | `0` | `<마지막 조향각>,max(stop_brake_level, /brake_level)` |
+| 4 | 정상 자율주행 | `<펄스>` | `<조향각>,<​/brake_level>` |
+
+`/brake_level` 은 **우선순위 4(정상 자율주행)에서만 그대로 반영**됩니다. 3에서는
+`stop_brake_level` 과 큰 쪽을 취합니다 — '정지 지시'가 더 강한 의도이므로, 그때 마침
+`/brake_level=0` 을 받고 있었다고 브레이크를 풀면 안 됩니다. 1·2에서는 아래 규칙이 이깁니다.
 
 - **E-stop** : 리니어 2단 체결과 해제(0단 복귀)는 **B보드 펌웨어가 스스로 한다**
   (`kasa_0804_B.ino [0804-3]`). ROS 가 브레이크를 지시할 필요가 없고, e-stop 중에는
@@ -281,7 +310,7 @@ sudo usermod -aG dialout $USER    # 재로그인 필요
 | 이름 | 기본 | 설명 |
 |---|---|---|
 | `baud` | 115200 | A/B 공통 |
-| `steer_invert` | `true` | white(+좌) ↔ kasa B보드(+우) 부호 반전 |
+| `steer_invert` | **`false`** | 조향 부호 반전. ROS·보드가 같은 규약(− 좌 / + 우)이라 기본은 반전 없음. 배선/펌웨어를 뒤집었을 때만 `true` |
 | `stop_brake_level` | `0` | `/control_state=False` 시 브레이크 단계 (0=코스트 / 1=약) |
 | `manual_brake_level` | `2` | 수동조종 진입 시 브레이크 단계 |
 | `manual_release_raw` | `240` | 위 브레이크를 풀 쓰로틀 raw 임계 |

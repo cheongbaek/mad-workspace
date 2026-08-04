@@ -5,7 +5,7 @@
 
 ┌─ g.launch.py (이 파일) — 하드웨어 계층 ────────────────────────────────────────┐
 │  arduino            A/B 2보드 (인휠 PID / 조향·제동)                          │
-│      구독 /cmd_vel_raw /control_state                                        │
+│      구독 /cmd_vel_raw /control_state /brake_level                           │
 │      발행 /encoder /steer_angle_measured /vehicle_mode /throttle_pedal        │
 │           /drive_pulse_cmd /estop /board_status                              │
 │  iahrs              iAHRS IMU            → /imu/data (+ TF)                  │
@@ -136,9 +136,10 @@ def generate_launch_description():
             'baud', default_value='115200',
             description='A/B 보드 공통 시리얼 보드레이트'),
         DeclareLaunchArgument(
-            'steer_invert', default_value='true',
-            description='조향 부호 반전. white(+좌) ↔ kasa B보드(+우) 규약 차이를 흡수한다. '
-                        '배선이나 펌웨어를 바꿨다면 false'),
+            'steer_invert', default_value='false',
+            description='조향 부호 반전. ★기본 false★ — ROS 토픽과 B보드가 같은 규약'
+                        '(− 좌 / + 우)을 쓴다. 배선이나 펌웨어를 뒤집어 방향이 반대가 '
+                        '되었을 때만 true 로 둔다'),
         DeclareLaunchArgument(
             'stop_brake_level', default_value='0',
             description='/control_state=False 일 때 걸 브레이크 단계. '

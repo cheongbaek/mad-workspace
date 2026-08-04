@@ -325,7 +325,8 @@ class CameraJudgment(Node):
         아래 정지·서행 판정(tl_decel, tl_far_cap, cw_slow_cap, v=√(2·a·d))은 전부 m/s
         영역에서 그대로 돌린다 — 펄스로 바꾸면 감속도 적분식이 성립하지 않는다.
         환산은 맨 끝 publish 직전 한 줄에서만 한다.
-        조향 부호는 건드리지 않는다(ROS 안은 white 부호 +좌, 반전은 arduino.py 담당)."""
+        조향 부호는 건드리지 않는다 — driving 이 이미 ROS 규약(− 좌 / + 우)으로 보내므로
+        그대로 통과시킨다. 부호가 뒤집히는 곳은 driving.publish_cmd 한 곳뿐이다."""
         out = Twist()
         out.angular.z = ku.clamp_steer_deg(msg.angular.z)  # 조향은 항상 driving(GPS 경로추종)
         v_in = float(msg.linear.x)

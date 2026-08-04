@@ -683,7 +683,8 @@ class DrivingNode(Node):
         #   kasa B보드는 가변저항 피드백으로 ★조향각 PD 폐루프★를 돌아 명령각에 수렴한다
         #   (kasa_0804_B.ino updateSteer, 하드리밋 좌576/우362 실측, 도달판정 ±3 raw).
         #   즉 '명령 대비 실현 부족'을 아두이노가 이미 잡으므로, ROS 가 또 나누면 과조향이 된다.
-        #   재측정법: 이제 /steer_angle_measured(B보드 실측각, white 부호)가 상시 오므로
+        #   재측정법: 이제 /steer_angle_measured(B보드 실측각, ROS 규약 − 좌 / + 우)가 상시 오므로
+        #     ★내부 δ_ctrl 과 부호가 반대라는 점에 주의★ (비교 시 한쪽을 뒤집어야 한다)
         #     로스백에서 (실측각 / 명령각) 기울기를 직접 읽으면 된다. 1.0 에서 벗어나면
         #     그 값을 아래 L/R 에 넣는다. (white 차량은 이 토픽이 옵션이라 요레이트로 역산해야 했다)
         self.STEER_PLANT_GAIN = 1.0        # (하위호환/기본값) 좌우 분리는 아래 L/R 사용
@@ -1366,10 +1367,15 @@ class DrivingNode(Node):
         steer_out = max(-self.STEER_MAX_DEG, min(self.STEER_MAX_DEG, steer_out))
         msg = Twist()
         # ★ [kasa 이식] 단위 분기 ★ 위 self._publish_pulse 주석 참고.
-        #   조향 부호는 여기서 뒤집지 않는다 — ROS 안은 white 부호(+좌)로 통일하고,
-        #   kasa 부호(+우)로의 반전은 nxde/arduino.py 가 시리얼 전송 직전에 한다.
         msg.linear.x  = float(ku.ms_to_pulse(speed_ms)) if self._publish_pulse else speed_ms
-        msg.angular.z = ku.clamp_steer_deg(steer_out)
+        # ★★ [2026-08-04] 조향 부호를 여기서 ROS 규약으로 뒤집는다 ★★
+        #   제어기 내부(steer_out, prev_steer, GAIN_L/R, TRIM)는 '+ = 좌회전' 기준으로
+        #   실측·튜닝된 값이라 그대로 보존하고, ROS 토픽 규약(− 좌 / + 우 = kasa B보드와
+        #   동일)으로는 발행 직전에만 맞춘다.
+        #   ★코드 전체에서 조향 부호가 뒤집히는 지점은 이 한 줄뿐이다★
+        #   (arduino.py 의 steer_invert 는 이제 기본 False — 거기서 또 뒤집으면 이중 반전)
+        #   근거·경위는 white/kasa_units.py 헤더 3절 참고.
+        msg.angular.z = ku.to_ros_steer(steer_out)
         self.drive_pub.publish(msg)
         # 내부 기록·디버그는 계속 m/s 다(튜닝 수치의 의미를 보존한다)
         self.last_published_speed = speed_ms
